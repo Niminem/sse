@@ -25,7 +25,7 @@ type
     socket: Socket
     parser: SseParser
     lastEventId: string
-    reconnectionTime: int
+    reconnectionTime*: int
     reconnectAttempts: int
     closed: bool
     isChunked: bool
