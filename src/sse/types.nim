@@ -27,6 +27,7 @@ type
     maxReconnectTime*: int
     maxReconnectAttempts*: int
     inactivityTimeout*: int
+    stripCrossOriginHeaders*: bool
     cancelToken*: CancelToken
     parserConfig*: SseParserConfig
 
@@ -58,6 +59,7 @@ proc initEventSourceConfig*(reconnectionTime = 3000,
                             maxReconnectTime = 60_000,
                             maxReconnectAttempts = 0,
                             inactivityTimeout = 0,
+                            stripCrossOriginHeaders = true,
                             cancelToken: CancelToken = nil,
                             parserConfig = initSseParserConfig()): EventSourceConfig =
   result = EventSourceConfig(
@@ -66,6 +68,7 @@ proc initEventSourceConfig*(reconnectionTime = 3000,
     maxReconnectTime: maxReconnectTime,
     maxReconnectAttempts: maxReconnectAttempts,
     inactivityTimeout: inactivityTimeout,
+    stripCrossOriginHeaders: stripCrossOriginHeaders,
     cancelToken: cancelToken,
     parserConfig: parserConfig
   )

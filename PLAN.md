@@ -445,7 +445,7 @@ proc close*(es: EventSource)
 2. Open a TCP socket to the server.
 3. Send HTTP GET request with headers:
    - `Accept: text/event-stream`
-   - `Cache-Control: no-cache`
+   - `Cache-Control: no-store`
    - If `lastEventId` is non-empty: `Last-Event-ID: <value>`
 4. Read response status and headers.
 
@@ -453,13 +453,21 @@ proc close*(es: EventSource)
 
 - **200 with `Content-Type: text/event-stream`** → announce the connection:
   set `readyState` to `OPEN`, call `onOpen`. Begin streaming the body
-  through the parser.
-- **HTTP 204 No Content** → fail the connection. Set `readyState` to
-  `CLOSED`, call `onError`. Do NOT reconnect.
-- **HTTP 301 / 307** → follow the redirect (update URL, reconnect).
-  301 updates the URL permanently; 307 does not.
+  through the parser. The Content-Type check compares the MIME type
+  essence only — `text/event-stream; charset=utf-8` is accepted.
+- **HTTP 301 / 302 / 307 / 308** → follow the redirect.
+  - 301 / 308 (permanent): update the stored URL for future reconnections.
+  - 302 / 307 (temporary): use the new URL for this attempt only; keep
+    the original URL for future reconnections.
+  - Limit redirect hops (e.g. max 20) to prevent infinite loops.
 - **Any other non-200, or wrong `Content-Type`** → fail the connection.
   Set `readyState` to `CLOSED`, call `onError`. Do NOT reconnect.
+  (HTTP 204 is commonly used by servers as a deliberate "stop reconnecting"
+  signal — the client treats it the same as any non-200: fail.)
+- **End-of-stream (clean EOF)** → the server closed the connection
+  normally. Reestablish the connection (reconnect). This is per spec
+  §9.2.2 step 14: "if res is not a network error, then reestablish
+  the connection."
 - **Network error** → reestablish the connection (reconnect), unless
   the error is known to be unrecoverable.
 - **Aborted network error** → fail the connection (no reconnect).
@@ -477,6 +485,21 @@ The client enforces `minReconnectTime` and `maxReconnectTime` bounds from
 the config.
 
 If `maxReconnectAttempts` is set and exceeded, fail the connection.
+
+#### ReadyState Guards (spec §9.2.3)
+
+Every state transition must check `readyState` before acting, since
+`close()` can be called at any time (including from within a callback):
+
+- **Announce the connection:** only if `readyState != rsClosed`, set to
+  `OPEN` and call `onOpen`.
+- **Reestablish the connection:** if `readyState == rsClosed`, abort the
+  reconnection sequence entirely.
+- **Fail the connection:** only if `readyState != rsClosed`, set to
+  `CLOSED` and call `onError`.
+
+This ensures that once `close()` has been called, no further callbacks
+fire and no reconnection is attempted.
 
 #### Cancellation
 
@@ -498,9 +521,30 @@ initiates reconnection.
 ### Last-Event-ID (spec §9.2.4)
 
 The `Last-Event-ID` HTTP request header is sent when reconnecting.
-Its value is the `lastEventId` string maintained by the parser (set by
-`id` fields in the event stream). The value is UTF-8 encoded and must
-not contain NULL (U+0000), LF (U+000A), or CR (U+000D).
+Its value is read via `parser.lastEventId` — this getter exposes the
+parser's internal `lastEventIdBuf`, which is updated on every `id`
+field and never reset by dispatch (per spec §9.2.6 step 1). The value
+is UTF-8 encoded and must not contain NULL (U+0000), LF (U+000A), or
+CR (U+000D).
+
+The client reads `parser.lastEventId` before reconnecting, which
+correctly captures IDs set even during empty dispatches (where no
+`onEvent` callback fires).
+
+### Retry Field & `onRetry` Callback (spec §9.2.6)
+
+Per spec, the `retry` field updates the event stream's reconnection
+time **immediately** at field-processing time — not at dispatch time.
+This means `retry: 5000\n\n` (retry with no data) must still update
+the client's reconnection time, even though no event is dispatched.
+
+The parser's `push` proc accepts an optional `onRetry: proc(ms: int)`
+callback. It fires synchronously the moment a valid `retry` field is
+parsed, before the blank-line dispatch. The client uses this to update
+its `reconnectionTime` immediately.
+
+The `SseEvent.retry` field is still populated for convenience (with
+the value at dispatch time, or -1 if no retry appeared in the block).
 
 ---
 
@@ -587,15 +631,20 @@ Additional edge case tests:
 Integration tests using a local `std/asynchttpserver`:
 
 - Successful connection and event receipt.
-- Auto-reconnection on connection drop.
+- Auto-reconnection on connection drop (clean server-side EOF).
 - `Last-Event-ID` sent on reconnection.
+- `Last-Event-ID` updated even from empty dispatch (id field with no data).
 - HTTP 204 → connection closed, no reconnect.
-- HTTP 301/307 → redirect followed.
+- HTTP 301/308 → permanent redirect (URL updated for reconnection).
+- HTTP 302/307 → temporary redirect (original URL kept).
 - Non-200 / wrong content type → connection failed.
-- `retry` field updates reconnection time.
+- Content-Type with parameters accepted (`text/event-stream; charset=utf-8`).
+- `retry` field updates reconnection time (including retry-only blocks with no data).
 - Cancel token stops the connection.
+- `close()` from within a callback prevents further callbacks/reconnection.
 - Inactivity timeout triggers reconnection.
 - Security limits enforced through the client.
+- Redirect loop protection (max hops).
 
 ### Server Tests (`t_server.nim`)
 
@@ -618,13 +667,17 @@ Integration tests using a local `std/asynchttpserver`:
 
 ### §9.2.3 — Processing Model
 
-- [ ] Announce connection: set readyState to OPEN, fire `open`
-- [ ] Reestablish connection: set readyState to CONNECTING, fire `error`, wait reconnectionTime, reconnect with Last-Event-ID
-- [ ] Fail connection: set readyState to CLOSED, fire `error`, do not reconnect
-- [ ] Response validation: must be 200 with Content-Type text/event-stream
+- [ ] Announce connection: set readyState to OPEN, fire `open` (guard: only if readyState != CLOSED)
+- [ ] Reestablish connection: set readyState to CONNECTING, fire `error`, wait reconnectionTime, reconnect with Last-Event-ID (guard: abort if readyState == CLOSED)
+- [ ] Fail connection: set readyState to CLOSED, fire `error`, do not reconnect (guard: only if readyState != CLOSED)
+- [ ] Response validation: must be 200 with Content-Type text/event-stream (MIME essence check)
+- [ ] End-of-stream (clean EOF) → reestablish
 - [ ] Network error → reestablish (unless futile)
 - [ ] Aborted network error → fail
 - [ ] Non-200 or wrong content type → fail
+- [ ] HTTP 301/308 redirects update stored URL permanently
+- [ ] HTTP 302/307 redirects are temporary (original URL preserved)
+- [ ] Redirect loop protection (max hops)
 
 ### §9.2.4 — Last-Event-ID Header
 
@@ -649,9 +702,10 @@ Integration tests using a local `std/asynchttpserver`:
 - [ ] Field `data` → append value + LF to data buffer
 - [ ] Field `event` → set event type buffer
 - [ ] Field `id` → set last event ID buffer (unless value contains NULL)
-- [ ] Field `retry` → set reconnection time (if all ASCII digits)
+- [ ] Field `retry` → set reconnection time immediately (if all ASCII digits); fires `onRetry` callback
 - [ ] Unknown fields → ignored
-- [ ] Dispatch: skip if data buffer empty; strip trailing LF from data
+- [ ] Dispatch step 1: set event source's lastEventId from buffer (unconditional, even if data empty)
+- [ ] Dispatch step 2: skip if data buffer empty; strip trailing LF from data
 - [ ] Dispatch resets data buffer and event type buffer, NOT last event ID buffer
 - [ ] End of stream discards incomplete event
 

@@ -9,6 +9,7 @@ type
     dataBuf: string
     eventTypeBuf: string
     lastEventIdBuf: string
+    committedLastEventId: string
     retryValue: int
     lineBuf: string
     lastCharWasCr: bool
@@ -20,6 +21,7 @@ proc initSseParser*(config = initSseParserConfig()): SseParser =
     dataBuf: "",
     eventTypeBuf: "",
     lastEventIdBuf: "",
+    committedLastEventId: "",
     retryValue: -1,
     lineBuf: "",
     lastCharWasCr: false,
@@ -30,12 +32,14 @@ proc reset*(parser: var SseParser) =
   parser.dataBuf.setLen(0)
   parser.eventTypeBuf.setLen(0)
   parser.lastEventIdBuf.setLen(0)
+  parser.committedLastEventId.setLen(0)
   parser.retryValue = -1
   parser.lineBuf.setLen(0)
   parser.lastCharWasCr = false
   parser.bomState = bsNeedFirst
 
-proc processField(parser: var SseParser, line: openArray[char]) =
+proc processField(parser: var SseParser, line: openArray[char],
+                   onRetry: proc(ms: int)) =
   var colonPos = -1
   for i in 0 ..< line.len:
     if line[i] == ':':
@@ -80,12 +84,20 @@ proc processField(parser: var SseParser, line: openArray[char]) =
         return
     var val = 0
     for c in fieldValue:
-      val = val * 10 + (ord(c) - ord('0'))
+      let digit = ord(c) - ord('0')
+      if val > (high(int) - digit) div 10:
+        return
+      val = val * 10 + digit
     parser.retryValue = val
+    if onRetry != nil:
+      onRetry(val)
   else:
     discard
 
 proc dispatchEvent(parser: var SseParser, onEvent: proc(event: SseEvent)) =
+  # §9.2.6 step 1: commit the last event ID unconditionally
+  parser.committedLastEventId = parser.lastEventIdBuf
+
   if parser.dataBuf.len == 0:
     parser.eventTypeBuf.setLen(0)
     parser.retryValue = -1
@@ -94,9 +106,11 @@ proc dispatchEvent(parser: var SseParser, onEvent: proc(event: SseEvent)) =
   if parser.dataBuf[^1] == '\n':
     parser.dataBuf.setLen(parser.dataBuf.len - 1)
 
+  let eventType = if parser.eventTypeBuf.len == 0: "message"
+                  else: parser.eventTypeBuf
   let event = SseEvent(
     data: parser.dataBuf,
-    eventType: parser.eventTypeBuf,
+    eventType: eventType,
     id: parser.lastEventIdBuf,
     retry: parser.retryValue
   )
@@ -106,7 +120,8 @@ proc dispatchEvent(parser: var SseParser, onEvent: proc(event: SseEvent)) =
   parser.eventTypeBuf.setLen(0)
   parser.retryValue = -1
 
-proc processLine(parser: var SseParser, onEvent: proc(event: SseEvent)) =
+proc processLine(parser: var SseParser, onEvent: proc(event: SseEvent),
+                  onRetry: proc(ms: int)) =
   if parser.lineBuf.len == 0:
     parser.dispatchEvent(onEvent)
     return
@@ -115,7 +130,7 @@ proc processLine(parser: var SseParser, onEvent: proc(event: SseEvent)) =
     parser.lineBuf.setLen(0)
     return
 
-  parser.processField(parser.lineBuf)
+  parser.processField(parser.lineBuf, onRetry)
   parser.lineBuf.setLen(0)
 
 proc consumeBom(parser: var SseParser, chunk: openArray[char], pos: var int) =
@@ -143,7 +158,8 @@ proc consumeBom(parser: var SseParser, chunk: openArray[char], pos: var int) =
       parser.bomState = bsDone
 
 proc push*(parser: var SseParser, chunk: openArray[char],
-           onEvent: proc(event: SseEvent)) =
+           onEvent: proc(event: SseEvent),
+           onRetry: proc(ms: int) = nil) =
   if chunk.len == 0:
     return
 
@@ -160,7 +176,7 @@ proc push*(parser: var SseParser, chunk: openArray[char],
   while i < chunk.len:
     let c = chunk[i]
     if c == '\r':
-      parser.processLine(onEvent)
+      parser.processLine(onEvent, onRetry)
       if i == chunk.len - 1:
         parser.lastCharWasCr = true
       else:
@@ -168,7 +184,7 @@ proc push*(parser: var SseParser, chunk: openArray[char],
           inc i
       inc i
     elif c == '\n':
-      parser.processLine(onEvent)
+      parser.processLine(onEvent, onRetry)
       inc i
     else:
       if parser.lineBuf.len >= parser.config.maxLineLen:
@@ -182,3 +198,10 @@ proc push*(parser: var SseParser, chunk: openArray[char]): seq[SseEvent] =
     events.add event
   )
   return events
+
+proc lastEventId*(parser: SseParser): string =
+  parser.committedLastEventId
+
+proc `lastEventId=`*(parser: var SseParser, value: string) =
+  parser.lastEventIdBuf = value
+  parser.committedLastEventId = value

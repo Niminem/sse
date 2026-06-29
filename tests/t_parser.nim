@@ -167,14 +167,14 @@ suite "parser - event type field":
     let events = p.push("event: ping\ndata: a\n\ndata: b\n\n")
     check events.len == 2
     check events[0].eventType == "ping"
-    check events[1].eventType == ""
+    check events[1].eventType == "message"
 
   test "event type with no data does not dispatch":
     var p = initSseParser()
     let events = p.push("event: foo\n\ndata: x\n\n")
     check events.len == 1
     check events[0].data == "x"
-    check events[0].eventType == ""
+    check events[0].eventType == "message"
 
 suite "parser - id field":
   test "id with NULL is ignored":
@@ -360,3 +360,24 @@ suite "parser - reset":
     let events = p.push("data: fresh\n\n")
     check events.len == 1
     check events[0].data == "fresh"
+
+suite "parser - retry overflow":
+  test "huge retry value is ignored (overflow protection)":
+    var p = initSseParser()
+    let events = p.push("retry: 99999999999999999999\ndata: x\n\n")
+    check events.len == 1
+    check events[0].retry == -1
+
+  test "max int boundary is accepted":
+    var p = initSseParser()
+    let events = p.push("retry: 1000000\ndata: x\n\n")
+    check events.len == 1
+    check events[0].retry == 1000000
+
+  test "overflow does not corrupt subsequent retry":
+    var p = initSseParser()
+    let events = p.push(
+      "retry: 99999999999999999999\ndata: a\n\nretry: 5000\ndata: b\n\n")
+    check events.len == 2
+    check events[0].retry == -1
+    check events[1].retry == 5000

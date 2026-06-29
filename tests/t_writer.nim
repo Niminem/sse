@@ -179,14 +179,20 @@ suite "writer - roundtrip (parse ∘ serialize = id)":
     var p = initSseParser()
     let parsed = p.push(serialize(original))
     check parsed.len == 1
-    check parsed[0] == original
+    check parsed[0].data == original.data
+    check parsed[0].eventType == "message"
+    check parsed[0].id == original.id
+    check parsed[0].retry == original.retry
 
   test "multi-line data":
     let original = SseEvent(data: "line1\nline2\nline3", eventType: "", id: "", retry: -1)
     var p = initSseParser()
     let parsed = p.push(serialize(original))
     check parsed.len == 1
-    check parsed[0] == original
+    check parsed[0].data == original.data
+    check parsed[0].eventType == "message"
+    check parsed[0].id == original.id
+    check parsed[0].retry == original.retry
 
   test "all fields":
     let original = SseEvent(data: "payload", eventType: "update", id: "7", retry: 5000)
@@ -200,7 +206,10 @@ suite "writer - roundtrip (parse ∘ serialize = id)":
     var p = initSseParser()
     let parsed = p.push(serialize(original))
     check parsed.len == 1
-    check parsed[0] == original
+    check parsed[0].data == original.data
+    check parsed[0].eventType == "message"
+    check parsed[0].id == original.id
+    check parsed[0].retry == original.retry
 
   test "event type only (no id, no retry)":
     let original = SseEvent(data: "msg", eventType: "chat", id: "", retry: -1)
@@ -214,14 +223,20 @@ suite "writer - roundtrip (parse ∘ serialize = id)":
     var p = initSseParser()
     let parsed = p.push(serialize(original))
     check parsed.len == 1
-    check parsed[0] == original
+    check parsed[0].data == original.data
+    check parsed[0].eventType == "message"
+    check parsed[0].id == original.id
+    check parsed[0].retry == original.retry
 
   test "data with trailing newline":
     let original = SseEvent(data: "hello\n", eventType: "", id: "", retry: -1)
     var p = initSseParser()
     let parsed = p.push(serialize(original))
     check parsed.len == 1
-    check parsed[0] == original
+    check parsed[0].data == original.data
+    check parsed[0].eventType == "message"
+    check parsed[0].id == original.id
+    check parsed[0].retry == original.retry
 
   test "multiple events in sequence":
     let events = @[
@@ -247,6 +262,7 @@ suite "writer - roundtrip (parse ∘ serialize = id)":
     let parsed = p.push(serialize(original))
     check parsed.len == 1
     check parsed[0].data == "line1\nline2"
+    check parsed[0].eventType == "message"
 
   test "data with CRLF normalizes to LF on roundtrip":
     let original = SseEvent(data: "line1\r\nline2", eventType: "", id: "", retry: -1)
@@ -254,6 +270,7 @@ suite "writer - roundtrip (parse ∘ serialize = id)":
     let parsed = p.push(serialize(original))
     check parsed.len == 1
     check parsed[0].data == "line1\nline2"
+    check parsed[0].eventType == "message"
 
   test "data with mixed line endings normalizes on roundtrip":
     let original = SseEvent(data: "a\rb\nc\r\nd", eventType: "", id: "", retry: -1)
@@ -261,9 +278,9 @@ suite "writer - roundtrip (parse ∘ serialize = id)":
     let parsed = p.push(serialize(original))
     check parsed.len == 1
     check parsed[0].data == "a\nb\nc\nd"
+    check parsed[0].eventType == "message"
 
   test "id persistence across events (spec behavior)":
-    # Second event has no id field emitted, so parser carries forward id from first
     let e1 = SseEvent(data: "a", eventType: "", id: "42", retry: -1)
     let e2 = SseEvent(data: "b", eventType: "", id: "", retry: -1)
     var buf = ""
@@ -272,6 +289,9 @@ suite "writer - roundtrip (parse ∘ serialize = id)":
     var p = initSseParser()
     let parsed = p.push(buf)
     check parsed.len == 2
-    check parsed[0] == e1
+    check parsed[0].data == "a"
+    check parsed[0].eventType == "message"
+    check parsed[0].id == "42"
     check parsed[1].data == "b"
-    check parsed[1].id == "42"  # persisted from first event per spec
+    check parsed[1].eventType == "message"
+    check parsed[1].id == "42"
