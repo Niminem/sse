@@ -60,11 +60,74 @@ Nothing ever depends "upward".
 
 ---
 
-## Phase 1 - Core types (`types.nim`)
+## Phase 1 - Core types (`types.nim`) ✅
+
+Pure data definitions, no logic, no imports.
+
+- `ReadyState` enum: `Connecting` (0), `Open` (1), `Closed` (2).
+- `SseEvent` object: `eventType`, `data`, `lastEventId`, `origin` (all `string`).
+- Callback type aliases:
+  - `SseEventHandler = proc (event: SseEvent) {.closure, gcsafe.}` — for `onEvent`.
+  - `SseCommentHandler = proc (comment: string) {.closure, gcsafe.}` — for `onComment`.
+  - `SseNotifyHandler = proc () {.closure, gcsafe.}` — for `onOpen`.
+  - `SseErrorHandler = proc (msg: string) {.closure, gcsafe.}` — for `onError`.
+
+Key decisions:
+- `eventType` field (not `type` or `kind`) to avoid Nim keyword ambiguity.
+- Single `onEvent` callback for all event types (no separate `onMessage`).
+- `onError` takes a `string` reason (pragmatic over spec-pure no-arg).
+- `origin` defaults to `""`, set by the client layer (parser never touches it).
+- Parser state is **not** here; it lives privately in `parser.nim`.
 
 ---
 
-## Phase 2 - Parser (`parser.nim`)
+## Phase 2 - Parser (`parser.nim`) ✅
+
+Incremental, pure (no I/O) SSE event stream parser. Transport-agnostic: callers feed raw
+UTF-8 chunks, parser emits complete events via callbacks. Tested exhaustively against every
+spec example and edge case in `tests/t_parser.nim` (763 lines).
+
+### Public API
+
+- `initSseParser*(onEvent; reconnectionTime = 3000): SseParser` — constructor.
+- `feed*(parser; chunk: string)` — feed raw bytes; fires callbacks synchronously.
+- `complete*(parser)` — signal end-of-stream; flushes BOM buffer, discards incomplete events (spec §3.5).
+- `reset*(parser)` — prepare for a new stream after reconnection. Preserves `lastEventId`,
+  `reconnectionTime`, and callbacks; clears all parsing buffers and re-arms BOM detection.
+- `lastEventId*(parser): string` — read-only accessor for the last event ID string.
+
+### `SseParser` object
+
+Public fields: `onEvent`, `onComment`, `reconnectionTime`.
+Private state: `dataBuffer`, `eventTypeBuffer`, `lastEventIdBuf`, `lineBuf`, `hasCr`,
+`bomBuf`, `bomPending`.
+
+### Internal design
+
+- **BOM detection**: Buffers the first 0–3 bytes of a stream in `bomBuf`. Once 3 bytes
+  are available (or `complete` is called), `resolveBom` strips a leading UTF-8 BOM if
+  present and feeds the remainder into `scanLines`. Handles BOM split across multiple
+  `feed` calls.
+- **Line scanning** (`scanLines`): Splits data on CR / LF / CR LF. A trailing CR at the
+  end of a chunk sets `hasCr = true`; the next `feed` call checks whether a LF follows
+  (→ CR LF) or not (→ standalone CR). Accumulates partial lines in `lineBuf`.
+- **Line processing** (`processLine`): Implements spec §3.4 rules 1–4 (empty line →
+  dispatch, colon-prefixed → comment, contains colon → field+value with single leading
+  space stripped, no colon → field name with empty value).
+- **Field processing** (`processField`): Implements spec §4 for `event`, `data`, `id`,
+  `retry`; silently ignores unknown field names. `id` rejects values containing U+0000.
+  `retry` validates all-ASCII-digits, parses with saturation at `high(int)` to avoid overflow.
+- **Event dispatch** (`dispatchEvent`): Implements spec §5.1 — skips when data buffer is
+  empty, strips one trailing LF, defaults event type to `"message"`, preserves
+  `lastEventIdBuf` across events.
+
+Key decisions:
+- Parser never sets `SseEvent.origin`; that is the client layer's responsibility.
+- `onComment` receives everything after the leading colon (no space stripping for comments,
+  matching spec behavior — space stripping is only defined for field values).
+- `retry` parsing uses manual arithmetic with `high(int)` saturation instead of `parseInt`
+  to avoid exceptions on overflow.
+- `reset` re-arms `bomPending = true` because each new stream may have its own BOM.
 
 ---
 
