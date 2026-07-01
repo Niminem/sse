@@ -1,0 +1,95 @@
+---
+description: Working plan for implementing a spec-compliant SSE Library in Nim (stdlib only)
+alwaysApply: true
+---
+
+# Implementation Plan — Spec-Compliant SSE Library (Nim, stdlib only)
+
+This is the live, workable plan for a spec-compliant Server-Sent Events library in Nim using
+**only the standard library**. It is designed to be built **bottom-up, layer by layer**,
+where every layer is fully tested against the spec before the next
+layer begins. If a layer's exit criteria are met, we never have to revisit it.
+
+## Notable constraints
+
+- **Stdlib only.** No third-party packages.
+- **No `std/httpclient` / `std/asynchttpclient`.** HTTP is done by hand over sockets.
+- **UTF-8 only for Event streams.** Event streams **MUST** always be encoded as **UTF-8**.
+- **TLS is in v1** (`https://`), implemented via `std/net` + OpenSSL (`-d:ssl`).
+- **Event delivery is via callbacks** (`onOpen`, `onEvent`, `onError`).
+
+## Notable decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| TLS | In v1, OpenSSL via `-d:ssl` | Real endpoints are `https`. |
+| Delivery | Callbacks | Maps directly to the spec's event model + delivery guard. |
+| Parser I/O | None (pure) | Transport-agnostic core, exhaustively testable. |
+| `retry` surfacing | Parser state, client polls | Parser owns "reconnection time" (spec §4.4); client owns reconnect policy. |
+| Cancellation (async) | Cooperative flag + socket close | `await recv` unblocks naturally. |
+| Cancellation (sync) | Read timeout + flag poll | Blocking `recv` can't see a flag; wake periodically. |
+| Heartbeat | Server emits `: keepalive` ~15s; client has optional stall timeout | Spec §9.1 is server-side; client stall detection is the practical dual. |
+
+## Directory Layout
+
+```
+src/
+  sse.nim # umbrella; re-exports public API
+  sse/
+    types.nim
+    parser.nim
+    writer.nim
+    http.nim
+    client_async.nim
+    client_sync.nim
+    server.nim
+tests/
+  config.nims
+  t_parser.nim
+  t_writer.nim
+  t_server.nim
+  t_http.nim
+  t_client.nim # integration (async loopback)
+```
+
+## Dependencies
+
+Parser and writer are both pure (no I/O) transforms over `types`.
+Both clients depend on `parser` + `http`. Server depends on `writer`.
+Nothing ever depends "upward".
+
+---
+
+## Phase 1 - Core types (`types.nim`)
+
+---
+
+## Phase 2 - Parser (`parser.nim`)
+
+---
+
+## Phase 3 - Writer (`writer.nim`)
+
+---
+
+## Phase 4 - Server helpers (`server.nim`)
+
+---
+
+## Phase 5 - Manual HTTP layer (`http.nim`)
+
+---
+
+## Phase 6 - Async client (`client_async.nim`)
+
+---
+
+## Phase 7 - Sync client (`client_sync.nim`)
+
+---
+
+## Phase 8 - TLS (`https`) for both clients
+
+---
+
+## Phase 9 - Documentation

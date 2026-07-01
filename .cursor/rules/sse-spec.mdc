@@ -1,0 +1,728 @@
+---
+description: Full Server-Sent Events (SSE) specification used as the source of truth for this project
+alwaysApply: true
+---
+
+# Server-Sent Events (SSE) — Complete Specification
+
+> Based on the [WHATWG HTML Living Standard, Section 9.2](https://html.spec.whatwg.org/multipage/server-sent-events.html) (Last Updated 28 June 2026).
+
+---
+
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [The Event Stream Wire Format](#2-the-event-stream-wire-format)
+3. [Parsing an Event Stream](#3-parsing-an-event-stream)
+4. [Interpreting an Event Stream (Field Processing)](#4-interpreting-an-event-stream-field-processing)
+5. [Dispatching Events](#5-dispatching-events)
+6. [Connection Lifecycle](#6-connection-lifecycle)
+7. [The `Last-Event-ID` Header](#7-the-last-event-id-header)
+8. [HTTP Requirements and Behavior](#8-http-requirements-and-behavior)
+9. [Authoring Notes (Server-Side Guidance)](#9-authoring-notes-server-side-guidance)
+10. [Implementation Advice](#10-implementation-advice)
+
+---
+
+## 1. Overview
+
+Server-Sent Events (SSE) is a mechanism that allows servers to push data to clients over a single, long-lived HTTP connection. The protocol uses a simple text-based format with the MIME type `text/event-stream`.
+
+Key characteristics:
+
+- **Unidirectional**: Data flows from server to client only (the client initiates the HTTP request; the server streams responses).
+- **Text-based**: The stream is always encoded as **UTF-8**. There is no way to specify another character encoding.
+- **Automatic reconnection**: Clients automatically attempt to reconnect when a connection is lost, with a configurable delay.
+- **Event IDs**: The server can assign IDs to events, enabling the client to resume from where it left off after a reconnection.
+- **Named event types**: Events can be dispatched to different handlers based on a type field.
+
+---
+
+## 2. The Event Stream Wire Format
+
+### 2.1 MIME Type
+
+The MIME type (Content-Type) for an event stream is:
+
+```
+text/event-stream
+```
+
+### 2.2 Character Encoding
+
+Event streams **MUST** always be encoded as **UTF-8**. No other encoding is permitted.
+
+### 2.3 Formal Grammar (ABNF)
+
+The character set for this grammar is Unicode.
+
+```abnf
+stream        = [ bom ] *event
+event         = *( comment / field ) end-of-line
+comment       = colon *any-char end-of-line
+field         = 1*name-char [ colon [ space ] *any-char ] end-of-line
+end-of-line   = ( cr lf / cr / lf )
+
+; characters
+lf            = %x000A ; U+000A LINE FEED (LF)
+cr            = %x000D ; U+000D CARRIAGE RETURN (CR)
+space         = %x0020 ; U+0020 SPACE
+colon         = %x003A ; U+003A COLON (:)
+bom           = %xFEFF ; U+FEFF BYTE ORDER MARK
+name-char     = %x0000-0009 / %x000B-000C / %x000E-0039 / %x003B-10FFFF
+                ; a scalar value other than LF, CR, or COLON
+any-char      = %x0000-0009 / %x000B-000C / %x000E-10FFFF
+                ; a scalar value other than LF or CR
+```
+
+### 2.4 Structure Summary
+
+A stream is a sequence of **events** separated by **blank lines** (empty lines). Each event consists of one or more **lines**. Each line is either:
+
+- A **comment** (starts with `:`).
+- A **field** (contains a field name, optionally followed by `:` and a value).
+
+### 2.5 Line Endings
+
+Lines MUST be separated by one of the following:
+
+| Sequence | Description |
+|----------|-------------|
+| `CR LF` (U+000D U+000A) | Carriage Return followed by Line Feed |
+| `LF` (U+000A) | Line Feed alone |
+| `CR` (U+000D) | Carriage Return alone |
+
+All three forms are equivalent and interchangeable. Parsers MUST support all three.
+
+### 2.6 Byte Order Mark
+
+A single leading UTF-8 Byte Order Mark (U+FEFF) at the beginning of the stream, if present, MUST be stripped during decoding. This is handled by the UTF-8 decode algorithm.
+
+---
+
+## 3. Parsing an Event Stream
+
+### 3.1 Decoding
+
+The stream MUST be decoded using the **UTF-8 decode algorithm**, which strips one leading UTF-8 BOM (if any).
+
+### 3.2 Line-by-Line Parsing
+
+After decoding, the stream is parsed by reading **line by line**. A line ends at:
+
+- A `CR LF` pair (U+000D U+000A), OR
+- A single `LF` (U+000A) not preceded by `CR`, OR
+- A single `CR` (U+000D) not followed by `LF`
+
+> **Buffering note**: Since connections are expected to be long-lived, implementations should use line buffering (where a line ends with `LF`). Block buffering or line buffering with different expected line endings can cause delays in event dispatch.
+
+### 3.3 Parser State
+
+When a stream is parsed, three buffers MUST be associated with it and initialized to the **empty string**:
+
+| Buffer | Purpose |
+|--------|---------|
+| **data buffer** | Accumulates the `data` field values for the current event |
+| **event type buffer** | Holds the `event` field value (the event type name) |
+| **last event ID buffer** | Holds the most recently seen `id` field value |
+
+### 3.4 Line Processing Rules
+
+Each line is processed in the order received according to the following rules:
+
+#### Rule 1: Empty line (blank line)
+
+If the line is empty → **dispatch the event** (see [Section 5](#5-dispatching-events)).
+
+#### Rule 2: Comment (line starts with `:`)
+
+If the line starts with a U+003A COLON character (`:`) → **ignore the line** (it is a comment).
+
+Comments are useful for keep-alive pings and preventing proxy timeouts.
+
+#### Rule 3: Field with value (line contains `:`)
+
+If the line contains a U+003A COLON character (`:`):
+
+1. Let **field** be the characters before the **first** colon.
+2. Let **value** be the characters after the **first** colon.
+3. If **value** starts with a U+0020 SPACE character, **remove that single leading space** (only the first one).
+4. Process the field (see [Section 4](#4-interpreting-an-event-stream-field-processing)).
+
+#### Rule 4: Field without value (line has no `:`)
+
+If the line is not empty and does not contain a colon:
+
+- Use the **entire line** as the field name.
+- Use the **empty string** as the field value.
+- Process the field (see [Section 4](#4-interpreting-an-event-stream-field-processing)).
+
+### 3.5 End of Stream
+
+When the end of the stream is reached, any pending data MUST be discarded. If the stream ends in the middle of an event (before a final empty line), the incomplete event is **not** dispatched.
+
+---
+
+## 4. Interpreting an Event Stream (Field Processing)
+
+When processing a field, the action depends on the **field name**. Field names are compared **literally** with **no case folding** (they are case-sensitive).
+
+### 4.1 Field: `event`
+
+Set the **event type buffer** to the field value.
+
+### 4.2 Field: `data`
+
+1. Append the field value to the **data buffer**.
+2. Append a single U+000A LINE FEED (`LF`) character to the **data buffer**.
+
+This means multi-line data is built by having multiple `data:` lines; each appends its value followed by a newline.
+
+### 4.3 Field: `id`
+
+If the field value does **not** contain U+0000 NULL:
+- Set the **last event ID buffer** to the field value.
+
+If the field value **does** contain U+0000 NULL:
+- Ignore the field entirely (do nothing).
+
+The NULL restriction prevents ID injection attacks.
+
+### 4.4 Field: `retry`
+
+If the field value is non-empty and consists of **only ASCII digits** (U+0030 to U+0039):
+- Interpret the field value as a base-10 integer.
+- Set the event stream's **reconnection time** to that integer (in milliseconds).
+
+Otherwise (the value is empty, or contains any non-digit character):
+- Ignore the field entirely.
+
+### 4.5 Any Other Field Name
+
+The field is **ignored**.
+
+---
+
+## 5. Dispatching Events
+
+When a blank line is encountered, the implementation MUST dispatch the event as follows:
+
+### 5.1 Event Dispatch Algorithm
+
+1. **Set the last event ID string** of the event source to the value of the **last event ID buffer**.
+   - The buffer is **not** reset; it retains its value until next explicitly set by the server.
+
+2. **Check for empty data**: If the **data buffer** is an empty string:
+   - Set both the data buffer and the event type buffer to the empty string.
+   - **Return** (do not dispatch any event).
+
+3. **Trim trailing newline**: If the data buffer's last character is a U+000A LINE FEED (LF), remove that last character from the data buffer.
+
+4. **Create the event** with the following properties:
+
+   | Property | Value |
+   |----------|-------|
+   | `type` | Value of the event type buffer, or `"message"` if the event type buffer is empty |
+   | `data` | Contents of the data buffer (after trailing LF removal) |
+   | `lastEventId` | The last event ID string of the event source |
+   | `origin` | The origin of the event stream's final URL (after redirects) |
+
+5. **Reset buffers**: Set both the **data buffer** and the **event type buffer** to the empty string.
+   - Note: The **last event ID buffer** is intentionally NOT reset.
+
+6. **Deliver the event** (asynchronously, with a guard): Queue the event for delivery. At the point of actual delivery — not at creation time — check if the connection state is `CLOSED`. If it is, **silently drop the event**. Only deliver if the state is still non-CLOSED.
+
+   This means: if `close()` is called between event creation and event delivery, the event is never seen by the consumer. Implementations using async I/O, task queues, or threads must perform this check at delivery time, not parse time.
+
+### 5.2 Default Event Type
+
+If no `event` field was set (or it was set to the empty string), the event type defaults to **`"message"`**.
+
+### 5.3 Last Event ID Persistence
+
+The last event ID persists across events. If event A sets `id: 1` and event B has no `id` field, event B's `lastEventId` will still be `"1"`. The ID is only cleared when the server explicitly sends an `id` field with an empty value (`id` with no value after the colon, or `id:\n`).
+
+---
+
+## 6. Connection Lifecycle
+
+An SSE connection has three states:
+
+| State | Numeric Value | Description |
+|-------|:---:|-------------|
+| **CONNECTING** | 0 | Connection not yet established, or closed and reconnecting |
+| **OPEN** | 1 | Connection is active; events are being dispatched |
+| **CLOSED** | 2 | Connection is closed; no reconnection will be attempted |
+
+### 6.1 Construction and Initial Connection
+
+**Construction (synchronous — before any network activity):**
+
+1. **Parse the URL**: Parse the provided URL string relative to the caller's base URL. If parsing fails (the URL is invalid), construction MUST fail with an error immediately (in browser environments, a `"SyntaxError"` DOMException is thrown). No network request is made.
+2. **Store the parsed URL**: The event source stores the parsed URL record internally. The `url` property getter returns the **serialization** of this parsed URL record, which may differ from the original input string due to normalization (e.g., default port removal, percent-encoding, scheme lowercasing).
+3. Create the connection object with `readyState = CONNECTING` (0).
+
+**Connection (asynchronous):**
+
+4. Construct the HTTP request (see [Section 8](#8-http-requirements-and-behavior)).
+5. Initiate the request (fetch).
+6. Process the response:
+
+   | Response Condition | Action |
+   |---|---|
+   | Aborted network error | **Fail the connection** |
+   | Network error (non-abort) | **Reestablish the connection** (unless known to be futile) |
+   | Status is not `200` | **Fail the connection** |
+   | Content-Type is not `text/event-stream` (see [Section 8.2](#82-response-validation) for matching rules) | **Fail the connection** |
+   | Status is `200` AND Content-Type is `text/event-stream` | **Announce the connection** and begin interpreting the body line by line |
+
+7. When the response body completes (end-of-body) without a network error → **reestablish the connection**.
+
+### 6.2 Announce the Connection
+
+When announcing the connection, **queue a task** that runs the following steps:
+
+1. If `readyState` is `CLOSED`, return (do nothing).
+2. Set `readyState` to **OPEN** (1).
+3. Fire an **`open`** event.
+
+The `readyState` check occurs when the task executes, not when it is queued. This means `close()` called between queuing and execution will cause the task to no-op.
+
+### 6.3 Reestablish the Connection
+
+When reestablishing the connection (runs asynchronously):
+
+1. **Queue a task**:
+   - If `readyState` is `CLOSED`, abort (do nothing).
+   - Set `readyState` to **CONNECTING** (0).
+   - Fire an **`error`** event.
+
+2. **Wait** for a duration equal to the **reconnection time** (in milliseconds).
+
+3. **Optionally wait more**:
+   - If the previous attempt failed, implementations MAY apply **exponential backoff**.
+   - If there is no network connectivity, implementations MAY wait for the OS to signal connectivity has returned.
+
+4. **Wait** until the task from step 1 has completed (if it hasn't already).
+
+5. **Queue a task**:
+   - If `readyState` is not `CONNECTING`, return (do nothing).
+   - If the **last event ID string** is not empty, set the `Last-Event-ID` header in the request to that value (encoded as UTF-8).
+   - Fetch the request and process the response as in the initial connection (Section 6.1, step 6).
+
+### 6.4 Fail the Connection
+
+When failing the connection, **queue a task** that runs the following steps:
+
+1. If `readyState` is `CLOSED`, return (do nothing).
+2. Set `readyState` to **CLOSED** (2).
+3. Fire an **`error`** event.
+
+**Once the connection has been failed, the client does NOT attempt to reconnect.** This is the terminal state.
+
+### 6.5 Close (Client-Initiated)
+
+When the client calls `close()`:
+
+1. Abort any ongoing fetch/connection for this event source.
+2. Set `readyState` to **CLOSED** (2).
+3. No `error` event is fired.
+
+### 6.6 Reconnection Time
+
+- The reconnection time is initially **implementation-defined**, recommended to be in the region of a few seconds (e.g., 3000 ms).
+- The server can change it by sending a `retry` field with a new value in milliseconds.
+
+---
+
+## 7. The `Last-Event-ID` Header
+
+### 7.1 Purpose
+
+When reconnecting, the client sends the HTTP request header `Last-Event-ID` with the value of the event source's **last event ID string**. This allows the server to resume the stream from the correct point.
+
+### 7.2 Header Name
+
+```
+Last-Event-ID
+```
+
+### 7.3 Value Constraints
+
+The value is the last event ID string as set by the most recent `id` field, encoded as UTF-8. The value space is any UTF-8 string that does **NOT** contain:
+
+- U+0000 NULL
+- U+000A LINE FEED (LF)
+- U+000D CARRIAGE RETURN (CR)
+
+### 7.4 When It Is Sent
+
+- The header is sent only during **reconnection** (not on the initial connection).
+- It is sent only if the last event ID string is **not** the empty string.
+
+---
+
+## 8. HTTP Requirements and Behavior
+
+### 8.1 Request Construction
+
+When constructing the initial request:
+
+1. The request URL is the parsed URL record from construction (see [Section 6.1](#61-construction-and-initial-connection)).
+2. The request MAY include the header `Accept: text/event-stream` (this is optional, not required).
+3. The request's **cache mode** MUST be set to `no-store`.
+4. CORS: The request is a potential-CORS request. If `withCredentials` is `true`, the CORS credentials mode is `include`; otherwise it is `same-origin` (anonymous).
+
+### 8.2 Response Validation
+
+On receiving the response, the client MUST check:
+
+| Check | Failure Action |
+|-------|---------------|
+| Response is an aborted network error | Fail the connection |
+| Response is a (non-abort) network error | Reestablish the connection |
+| Response status ≠ `200` | Fail the connection |
+| Response `Content-Type` ≠ `text/event-stream` | Fail the connection |
+
+> **Content-Type matching nuance:** The Content-Type check compares the **MIME type essence** (the `type/subtype` portion), **case-insensitively**, and ignores any parameters. This means all of the following are valid and MUST be accepted:
+>
+> - `text/event-stream`
+> - `text/event-stream; charset=utf-8`
+> - `Text/Event-Stream`
+> - `text/event-stream; charset=utf-8; boundary=something`
+>
+> Implementations MUST NOT perform a strict string comparison against the full Content-Type header value. Parse the MIME type, extract the essence (`type/subtype`), and compare that case-insensitively against `text/event-stream`. Many servers include `charset=utf-8` as a parameter, and rejecting those responses would break real-world interoperability.
+
+### 8.3 Redirects
+
+HTTP **301** (Moved Permanently) and **307** (Temporary Redirect) redirects are followed as with normal HTTP requests.
+
+### 8.4 Stopping Reconnection via HTTP 204
+
+A server can tell the client to **stop reconnecting** by responding with HTTP **204 No Content**. Since the status is not 200, this will cause the connection to be **failed** (not reestablished).
+
+Any status code other than 200 causes a connection failure and prevents reconnection.
+
+### 8.5 CORS (Cross-Origin Resource Sharing)
+
+The SSE connection supports CORS. The `withCredentials` option controls whether cookies and other credentials are sent with cross-origin requests:
+
+- `false` (default): Anonymous CORS (no credentials sent).
+- `true`: Credentials included.
+
+---
+
+## 9. Authoring Notes (Server-Side Guidance)
+
+### 9.1 Keep-Alive Comments
+
+Legacy proxy servers may drop HTTP connections after a short timeout. Servers SHOULD send a comment line (starting with `:`) every ~15 seconds to keep the connection alive:
+
+```
+: keepalive
+```
+
+### 9.2 Chunked Transfer Encoding
+
+HTTP chunking can have unexpected negative effects on the reliability of event delivery, particularly if chunking is done by a middleware layer unaware of SSE timing requirements. If this is a problem, disable chunking for event streams.
+
+### 9.3 Connection Limits
+
+Browsers enforce per-origin connection limits (commonly 6 for HTTP/1.1). Multiple SSE connections to the same origin from different tabs/pages can exhaust these limits. Strategies to mitigate:
+
+- Use unique subdomains per connection.
+- Allow users to enable/disable SSE per page.
+- Share a single connection via a shared worker.
+
+Note: HTTP/2 multiplexes streams over a single TCP connection, largely mitigating this issue.
+
+### 9.4 Client Identification
+
+Relying on IP addresses to correlate clients is unreliable (multiple clients may share IPs via proxies, or a single client may have multiple IPs). Instead, embed a unique identifier in the served document and pass it as a URL parameter when establishing the connection.
+
+---
+
+## 10. Implementation Advice
+
+### 10.1 Garbage Collection / Resource Management
+
+- An event source object MUST be kept alive (not garbage collected) while:
+  - `readyState` is `CONNECTING` and there are listeners for `open`, `message`, or `error`.
+  - `readyState` is `OPEN` and there are listeners for `message` or `error`.
+  - There are pending tasks queued by the event source.
+
+- If the associated document/context is destroyed, the implementation MUST:
+  - Abort any ongoing fetch.
+  - Set `readyState` to `CLOSED`.
+
+- If the event source object is garbage collected while its connection is still open, the ongoing fetch MUST be aborted.
+
+### 10.2 Diagnostic Information
+
+Implementations are encouraged to provide detailed diagnostic information in developer consoles about:
+
+- Constructor arguments
+- Network errors
+- CORS status and relevant headers
+- Messages received and how they were parsed
+- Detailed context when `error` events fire (since the event objects themselves carry minimal information)
+
+---
+
+## Appendix A: Parsing Examples
+
+### Example 1: Simple Messages
+
+Stream:
+```
+data: This is the first message.
+
+data: This is the second message, it
+data: has two lines.
+
+data: This is the third message.
+
+```
+
+Result:
+- Event 1: type=`"message"`, data=`"This is the first message."`
+- Event 2: type=`"message"`, data=`"This is the second message, it\nhas two lines."`
+- Event 3: type=`"message"`, data=`"This is the third message."`
+
+### Example 2: Named Event Types
+
+Stream:
+```
+event: add
+data: 73857293
+
+event: remove
+data: 2153
+
+event: add
+data: 113411
+
+```
+
+Result:
+- Event 1: type=`"add"`, data=`"73857293"`
+- Event 2: type=`"remove"`, data=`"2153"`
+- Event 3: type=`"add"`, data=`"113411"`
+
+### Example 3: IDs and Reconnection
+
+Stream:
+```
+: test stream
+
+data: first event
+id: 1
+
+data:second event
+id
+
+data:  third event
+
+```
+
+Result:
+- Block 1 (`: test stream`): Comment only → no event fired.
+- Block 2: type=`"message"`, data=`"first event"`, lastEventId=`"1"`. The last event ID string is now `"1"`.
+- Block 3: type=`"message"`, data=`"second event"`, lastEventId=`""`. The `id` field with no value resets the last event ID to empty string. Note: `data:second event` (no space after colon) → value is `"second event"` (the space-stripping only removes a leading space if present; here there is none).
+- Block 4: type=`"message"`, data=`" third event"` (with a leading space). `data:  third event` → after the colon, the first space is stripped, leaving `" third event"` (one space remains).
+
+### Example 4: Empty Data Fields
+
+Stream:
+```
+data
+
+data
+data
+
+data:
+
+```
+
+Result (assuming each block above is followed by a blank line, except the last):
+- Block 1 (`data` + blank line): type=`"message"`, data=`""` (empty string). The field `data` with no colon has an empty string value; empty string is appended + LF → data buffer is `"\n"` → trailing LF stripped → `""`.
+- Block 2 (`data\ndata` + blank line): type=`"message"`, data=`"\n"` (single newline). Two `data` fields each append `"" + LF` → buffer is `"\n\n"` → trailing LF stripped → `"\n"`.
+- Block 3 (`data:` without following blank line): **Discarded** — the stream ended without a blank line after it.
+
+### Example 5: Space After Colon
+
+Stream:
+```
+data:test
+
+data: test
+
+```
+
+Both produce: type=`"message"`, data=`"test"`.
+
+The single space immediately after the colon is stripped if present. Only the **first** space is stripped — `data:  test` would produce `" test"` (one leading space).
+
+---
+
+## Appendix B: Complete Parsing Algorithm (Pseudocode)
+
+```
+function parse_event_stream(stream):
+    data_buffer = ""
+    event_type_buffer = ""
+    last_event_id_buffer = ""
+
+    decode stream as UTF-8 (stripping leading BOM if present)
+
+    for each line in stream (split on CR LF | CR | LF):
+
+        if line is empty:
+            dispatch_event(data_buffer, event_type_buffer, last_event_id_buffer)
+            data_buffer = ""
+            event_type_buffer = ""
+            // last_event_id_buffer is NOT reset
+
+        else if line starts with ':':
+            // comment; ignore
+
+        else if line contains ':':
+            field = substring before first ':'
+            value = substring after first ':'
+            if value starts with ' ' (U+0020):
+                value = value[1:]  // remove first character only
+            process_field(field, value)
+
+        else:
+            // line has no colon
+            process_field(line, "")
+
+    // End of stream: discard any pending data (no dispatch)
+
+
+function process_field(field, value):
+    if field == "event":
+        event_type_buffer = value
+
+    else if field == "data":
+        data_buffer += value
+        data_buffer += '\n'  // U+000A
+
+    else if field == "id":
+        if '\0' not in value:  // U+0000 NULL not present
+            last_event_id_buffer = value
+
+    else if field == "retry":
+        if value matches /^[0-9]+$/:
+            reconnection_time = parse_int(value)
+
+    else:
+        // ignore unknown fields
+
+
+function dispatch_event(data_buffer, event_type_buffer, last_event_id_buffer):
+    // Update the event source's last event ID string
+    event_source.last_event_id = last_event_id_buffer
+
+    if data_buffer == "":
+        return  // do not fire an event
+
+    // Strip trailing LF
+    if data_buffer ends with '\n':
+        data_buffer = data_buffer[:-1]
+
+    // Determine event type
+    event_type = event_type_buffer if event_type_buffer != "" else "message"
+
+    // Create the event
+    event = new Event(
+        type = event_type,
+        data = data_buffer,
+        lastEventId = event_source.last_event_id,
+        origin = final_url_origin
+    )
+
+    // Queue for delivery with readyState guard:
+    // At delivery time (not now), check if still open
+    queue_task(function():
+        if event_source.readyState != CLOSED:
+            deliver(event)
+        // else: silently drop
+    )
+```
+
+---
+
+## Appendix C: Connection State Machine
+
+```
+                    ┌──────────────────────────┐
+                    │                          │
+                    ▼                          │
+┌─────────────┐  success   ┌──────┐    end-of-body / network error
+│ CONNECTING  │ ─────────► │ OPEN │ ──────────┘
+│   (0)       │            │ (1)  │
+└─────┬───────┘            └──┬───┘
+      │                       │
+      │ fail                  │ fail / close()
+      │                       │
+      ▼                       ▼
+┌──────────────────────────────────┐
+│            CLOSED (2)            │
+│      (terminal - no retry)       │
+└──────────────────────────────────┘
+```
+
+**Transitions:**
+
+| From | Event | To | Action |
+|------|-------|----|--------|
+| CONNECTING | Response 200 + correct Content-Type | OPEN | Fire `open` event; begin parsing |
+| CONNECTING | Aborted network error / bad status / bad Content-Type | CLOSED | Fire `error` event |
+| CONNECTING | Non-abort network error (reestablish) | CONNECTING | Fire `error`; wait; retry |
+| OPEN | End-of-body (connection closed cleanly) | CONNECTING | Fire `error`; wait; retry |
+| OPEN | Network error (reestablish) | CONNECTING | Fire `error`; wait; retry |
+| OPEN | Fatal error (fail) | CLOSED | Fire `error` event |
+| OPEN | `close()` called | CLOSED | No event fired |
+| ANY | `close()` called | CLOSED | Abort fetch; no event |
+
+---
+
+## Appendix D: Summary of Recognized Fields
+
+| Field Name | Value Type | Behavior |
+|------------|-----------|----------|
+| `event` | Any string | Sets the event type for the next dispatched event |
+| `data` | Any string | Appends value + LF to the data buffer |
+| `id` | String without NULL | Sets the last event ID buffer (used for reconnection) |
+| `retry` | Non-empty, ASCII digits only | Sets the reconnection time in milliseconds |
+
+All other field names are silently ignored.
+
+---
+
+## Appendix E: Key Invariants for Implementers
+
+1. **Only one space is stripped**: After the colon, only a single leading U+0020 SPACE is removed. Additional spaces are part of the value.
+
+2. **Field names are case-sensitive**: `Data` ≠ `data`. Only lowercase field names are recognized.
+
+3. **Empty `id` resets the ID**: Sending `id` with no value (or `id:` followed by nothing) sets the last event ID buffer to the empty string. This prevents `Last-Event-ID` from being sent on reconnection.
+
+4. **NULL in `id` value is rejected**: If the `id` field's value contains U+0000, the entire field is ignored (the buffer retains its previous value).
+
+5. **Trailing LF is always stripped from data**: The dispatch algorithm removes one trailing LF from the data buffer. This means a single `data: hello\n` results in data `"hello"` (not `"hello\n"`).
+
+6. **No event fired when no `data` field is present**: If zero `data` fields appeared in the block, the data buffer remains the empty string and no event is dispatched. However, an empty `data` field (e.g., `data` with no colon, or `data:` with nothing after) *does* fire an event with `data = ""`, because the field processing appends `"" + LF` to the buffer, making it non-empty. The buffers are still reset regardless.
+
+7. **Event type resets per event**: The event type buffer is reset to empty after each dispatch. If the next event block has no `event` field, it will default to `"message"`.
+
+8. **Last event ID does NOT reset per event**: The last event ID buffer persists across events until explicitly changed by a new `id` field.
+
+9. **Stream must end with a blank line**: Data pending at end-of-stream without a trailing blank line is discarded.
+
+10. **Reconnection only on non-fatal closure**: The client only reconnects when the connection closes cleanly (end-of-body) or on a non-aborted network error. Any explicit failure (bad status, bad content-type, abort) is terminal.
+
+11. **Delivery is guarded by connection state**: Events are not delivered synchronously during parsing. At the point of actual delivery, the implementation must check that the connection is not `CLOSED`. If `close()` was called between parse time and delivery time, the event is silently dropped.
+
+12. **URL validation is synchronous**: An invalid URL must cause an error at construction time, before any network activity. The `url` property returns the serialized (normalized) form of the parsed URL, not the raw input string.
