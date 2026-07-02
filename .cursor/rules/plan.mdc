@@ -131,11 +131,88 @@ Key decisions:
 
 ---
 
-## Phase 3 - Writer (`writer.nim`)
+## Phase 3 - Writer (`writer.nim`) ✅
+
+Pure (no I/O) serializer for the SSE wire format. Server-side dual of `parser.nim`.
+Takes structured data (events, comments, retry, id) and produces valid
+`text/event-stream` bytes. Imports only `types`. Tested via round-trip with the
+parser and independent edge-case assertions in `tests/t_writer.nim`.
+
+### Public API
+
+- `serializeEvent*(event: SseEvent): string` — Full event → wire bytes, terminated by blank line.
+- `serializeComment*(comment: string): string` — Comment line(s), no trailing blank line.
+- `serializeRetry*(ms: int): string` — `retry:` line, no trailing blank line.
+- `serializeId*(id: string): string` — Standalone `id:` line, no trailing blank line.
+
+### Internal helpers
+
+- `sanitize(s: string; strip: set[char]): string` — Removes characters in `strip` from `s`.
+- `emitLines(result: var string; prefix: string; value: string)` — Splits `value` on all
+  line endings (CR, LF, CRLF) and emits one `prefix`-prefixed line per segment. A trailing
+  line ending produces a final empty segment.
+
+### Key decisions
+
+- **Line-ending safety**: The SSE wire format has no escape mechanism for CR/LF. All
+  serialization procs split multi-segment values on all three line-ending forms (CR, LF,
+  CRLF). Single-line fields (`event`, `id`) have CR/LF stripped to prevent wire corruption.
+- **`"message"` elision**: `serializeEvent` omits the `event:` line when the type is empty
+  or exactly `"message"` (the parser's default), reducing wire overhead.
+- **NULL + CR/LF stripped from IDs**: Spec §7.3 forbids NULL, LF, and CR in ID values.
+  The writer strips all three via `IdStripChars = {'\0', '\r', '\n'}`.
+- **Negative retry clamped to 0**: Spec requires non-negative integer; negatives are
+  silently clamped.
+- **No BOM emitted**: The writer never produces a BOM; that is a stream-start concern
+  handled by the transport layer (and stripped by the parser on the receiving end).
 
 ---
 
-## Phase 4 - Server helpers (`server.nim`)
+## Phase 4 - Server helpers (`server.nim`) ✅
+
+High-level helpers for serving SSE streams. Sits between the pure wire serializer
+(`writer.nim`) and whatever transport the caller uses. Manages per-connection state:
+auto-incrementing event IDs, a bounded replay buffer for reconnection, and keep-alive
+tracking. Imports `types`, `writer`, and `std/deques`. Tested in `tests/t_server.nim`
+(635 lines).
+
+### Public API
+
+- `initSseConnection*(historyLimit = 0; keepAliveIntervalMs = 15_000; nowMs = 0): SseConnection`
+- `formatEvent*(conn; data; eventType = ""; id = ""): string` — auto-assigns integer ID
+  when `id` is empty; appends to replay buffer.
+- `formatComment*(comment): string` — delegates to `serializeComment`.
+- `formatRetry*(ms): string` — delegates to `serializeRetry`.
+- `formatId*(conn; id): string` — emits standalone `id:` line, updates `conn.lastId`.
+- `hasEvent*(conn; id): bool` — checks replay buffer for an event with the given ID.
+- `replay*(conn; lastEventId): string` — returns wire bytes for all events after
+  `lastEventId`; returns all if ID not found.
+- `httpHeaders*(contentType = "text/event-stream"; extraHeaders = []): string` — HTTP/1.1
+  response preamble with `\r\n` endings terminated by `\r\n\r\n`.
+- `parseLastEventId*(headers): string` — extracts `Last-Event-ID` value from raw HTTP
+  request headers (case-insensitive, trimmed).
+- `markActivity*(conn; nowMs)` — records timestamp of last write.
+- `needsKeepAlive*(conn; nowMs): bool` — true when idle ≥ `keepAliveIntervalMs`.
+- `keepAliveComment*(): string` — returns `": keepalive\n"`.
+- `add*(conn; chunk)` — appends to internal send buffer.
+- `flush*(conn): string` — returns and clears internal send buffer.
+
+### `SseConnection` object
+
+Public fields: `nextId`, `lastId`, `lastActivityMs`, `keepAliveIntervalMs`.
+Private state: `history` (Deque), `historyLimit`, `buffer`.
+
+### Key decisions
+
+- **Auto-incrementing IDs**: Every `formatEvent` call assigns an ID (explicit or auto from
+  `nextId`). Use `serializeEvent` directly from writer for ID-less events.
+- **Replay buffer**: Bounded FIFO deque (`historyLimit`); 0 disables. Enables reconnection
+  via `parseLastEventId` + `replay`.
+- **Keep-alive is caller-driven**: `markActivity`/`needsKeepAlive` expose timing state;
+  the caller owns the actual timer/loop.
+- **Send buffer**: `add`/`flush` allow batching multiple chunks before a single write.
+- **`parseLastEventId` is self-contained**: Hand-rolled line-by-line scan with case-
+  insensitive header name match; no regex or stdlib HTTP parsing needed.
 
 ---
 
