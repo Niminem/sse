@@ -216,7 +216,56 @@ Private state: `history` (Deque), `historyLimit`, `buffer`.
 
 ---
 
-## Phase 5 - Manual HTTP layer (`http.nim`)
+## Phase 5 - Manual HTTP layer (`http.nim`) ✅
+
+Pure (no I/O, no sockets) client-side HTTP helpers. Both async and sync clients
+import this module and perform actual socket I/O themselves. Imports `std/[uri, strutils]`.
+Tested in `tests/t_http.nim` (122 tests across 17 suites).
+
+### Public API
+
+**URL:**
+- `parseSseUrl*(rawUrl): SseUrl` — validates scheme (http/https), host, port (1–65535).
+- `isDefaultPort*`, `origin*`, `hostHeader*`, `$*`, `toUri*` — URL accessors/serializers.
+- `resolveRedirect*(baseUrl; location): SseUrl` — RFC 3986 resolution via `std/uri.combine`.
+
+**Request:**
+- `buildRequest*(url; lastEventId = ""): string` — HTTP/1.1 GET with Host, Accept, Cache-Control.
+
+**Response parsing:**
+- `initHeaderParser*(maxSize = 65536): HeaderParser` — incremental header accumulator.
+- `feed*(hp; data): string` — feed raw bytes; returns unconsumed body bytes on completion.
+- `isComplete*`, `hasFailed*`, `failMessage*` — state queries.
+- `parse*(hp): HttpResponse` — structured status + headers from completed buffer.
+- `getHeader*`, `hasHeader*` — header lookup (names lowercased at parse time).
+
+**Validation:**
+- `validateResponse*(resp): SseConnectResult` — `scrOk` / `scrRedirect` / `scrFail`.
+- `isRedirect*`, `isPermanentRedirect*`, `redirectLocation*` — redirect helpers.
+
+**Transfer:**
+- `detectTransferMode*(resp): TransferMode` — `tmChunked` / `tmContentLength` / `tmIdentity`.
+- `contentLength*(resp): int` — parsed Content-Length or -1.
+- `initChunkedDecoder*(maxChunkSize = 16 MiB): ChunkedDecoder` — incremental chunked decoder.
+- `feed*(dec; data): string` — returns decoded body bytes with framing stripped.
+- `isFinished*`, `hasFailed*`, `failMessage*` — state queries.
+
+### Key decisions
+
+- **MIME essence matching**: Content-Type validated by extracting `type/subtype`, lowercased,
+  parameters ignored (spec §8.2). `text/event-stream; charset=utf-8` accepted.
+- **Redirect codes**: 301/302/303/307/308 all recognized. `isPermanentRedirect` distinguishes
+  301/308 so the client can update its stored URL.
+- **Header terminator detection**: `findHeaderEnd` recognizes `\n\n`, `\r\n\r\n` (via `\n\r\n`
+  subsequence), and mixed forms. Handles terminators split across `feed` calls with a 2-byte
+  backtrack on each invocation.
+- **`maxSize` enforced on both paths**: Rejects oversized headers whether the terminator is
+  found or not. Body bytes beyond the terminator don't count.
+- **Chunked decoder**: 6-state machine (`csReadSize` → `csReadSizeLf` → `csReadData` →
+  `csReadDataCr` → `csReadDataLf` → `csFinished`). Strips chunk extensions, validates hex,
+  guards against overflow and oversized chunks. Lenient on bare-LF line endings.
+- **No I/O**: All procs are pure transforms. Socket reads, TLS, and async/sync dispatch
+  are the client layers' responsibility.
 
 ---
 
