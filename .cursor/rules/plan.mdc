@@ -269,7 +269,86 @@ Tested in `tests/t_http.nim` (122 tests across 17 suites).
 
 ---
 
-## Phase 6 - Async client (`client_async.nim`)
+## Phase 6 - Async client (`client_async.nim`) ✅
+
+Full connection lifecycle client implementing the EventSource state machine over
+`std/asyncdispatch` + `std/asyncnet`. Manages connect → open → read → reconnect
+with automatic exponential backoff, redirect following, transfer-mode decoding,
+cooperative cancellation, and optional stall detection. Delivers events via
+callbacks set on the client object. Imports `types`, `parser`, `http`. Tested via
+threaded loopback servers in `tests/t_client_async.nim` (1339 lines, 13 suites).
+
+### Public API
+
+- `newAsyncSseClient*(rawUrl; config = DefaultConfig; cancelToken = nil): AsyncSseClient`
+  — constructor. Validates URL synchronously (spec §6.1 steps 1–3); raises `ValueError`
+  on invalid/unsupported URL. No network activity until `connect`.
+- `connect*(client) {.async.}` — main event loop. Runs until `close()` or fatal error.
+  Handles reconnection internally when `autoReconnect` is true.
+- `close*(client)` — immediate client-initiated close (spec §6.5). Sets `readyState`
+  to `Closed`, aborts socket. No error event fired.
+- `lastEventId*(client): string` — read-only accessor (delegates to parser).
+- `reconnectionTime*(client): int` — current reconnection time in ms.
+
+### Configuration
+
+`AsyncSseClientConfig` object with fields:
+- `autoReconnect` (bool, default `true`) — reconnect on connection loss.
+- `maxRedirects` (int, default `10`) — redirect limit per attempt.
+- `maxReconnectDelay` (int, default `60_000`) — backoff cap in ms.
+- `stallTimeout` (int, default `0`) — inactivity timeout; 0 disables.
+- `recvSize` (int, default `4096`) — socket recv buffer hint.
+
+### `AsyncSseClient` object
+
+Public fields: `readyState`, `url` (reconnection URL), `config`, `onEvent`,
+`onComment`, `onOpen`, `onError`.
+Private state: `parser`, `socket`, `cancelToken`, `consecutiveFailures`,
+`transferMode`, `chunkedDecoder`, `contentRemaining`.
+
+### Internal design
+
+- **`ConnectOutcome` enum**: `coSuccess` / `coRetry` / `coFatal` — guides the main loop.
+- **`attemptConnect`**: Opens socket, sends HTTP/1.1 GET (with `Last-Event-ID` on
+  reconnection), reads headers incrementally via `HeaderParser`, follows redirects
+  (permanent redirects update `client.url`), validates response (status + Content-Type).
+  On success: wires parser, resets parser, initializes transfer state, feeds any body
+  bytes that arrived with headers.
+- **`readBody`**: Reads the response body in a loop, feeding decoded chunks to the
+  parser. Supports `withTimeout` for stall detection; on timeout, closes the socket
+  and consumes the orphaned recv future's error to prevent asyncdispatch warnings.
+  Calls `parser.complete()` on all non-cancel exit paths (spec §3.5).
+- **`feedBody`**: Decodes body bytes based on `transferMode` (chunked / content-length /
+  identity) before feeding to parser.
+- **`wireParser`**: Connects parser callbacks to client callbacks, injecting `origin`
+  (from the effective/final URL) into each event. Guards delivery on `readyState`
+  (spec §5.1 step 6).
+- **`reconnectDelay`**: Exponential backoff formula `min(base * 2^failures, cap)`.
+  After a successful connection (`fireOpen`), `consecutiveFailures` resets to 0,
+  so first reconnect after clean end-of-body uses plain `reconnectionTime`.
+- **`cancelAwareSleep`**: Polls every 250ms during backoff delay, returning early if
+  `readyState` becomes `Closed` or cancel token fires.
+- **`CancelToken`** (in `types.nim`): Cooperative cancellation ref object. Shared
+  across multiple clients; a single `cancel()` call terminates all of them at their
+  next yield point.
+
+### Key decisions
+
+- **Permanent vs temporary redirects**: Only 301/308 update `client.url` (the
+  reconnection URL). 302/303/307 follow but don't persist.
+- **Origin from final URL**: `wireParser` uses the effective URL after all redirects,
+  matching spec §5.1 step 4.
+- **No TLS yet**: Socket opened as plain TCP. TLS wrapping (Phase 8) is stubbed with
+  a comment in `openSocket`.
+- **Stall timeout orphan handling**: When `withTimeout` fires before recv completes,
+  the socket is closed and `addCallback` on the orphan future discards any error,
+  preventing unhandled-exception pollution in asyncdispatch.
+- **`fireError` has no readyState guard**: Spec §6.4 fires error *after* setting
+  CLOSED. Guard is omitted since `close()` never calls `fireError`, and all internal
+  callers are protected by `isCancelled` checks.
+- **`parser.reset()` on each successful connect**: Clears buffers for the new stream
+  while preserving `lastEventId` and `reconnectionTime` (per spec reconnection
+  semantics).
 
 ---
 
