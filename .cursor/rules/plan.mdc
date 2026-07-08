@@ -50,7 +50,8 @@ tests/
   t_writer.nim
   t_server.nim
   t_http.nim
-  t_client.nim # integration (async loopback)
+  t_client_async.nim # integration (threaded loopback servers)
+  t_client_sync.nim  # port of the async suite for the sync client
 ```
 
 ## Dependencies
@@ -284,6 +285,8 @@ Covered by the existing async client test suite (behavior-neutral extraction).
   transfer mode (chunked / content-length / identity). Wraps `TransferMode`,
   `ChunkedDecoder`, and remaining-byte tracking in one unit.
   - `initBodyDecoder*(resp: HttpResponse): BodyDecoder` — built from validated headers.
+    An unparsable `Content-Length` falls back to identity mode (read until close)
+    instead of treating the body as already finished.
   - `decode*(dec; raw): string` — returns body bytes with framing stripped.
   - `isFinished*(dec): bool` — end-of-body (terminal chunk, length exhausted,
     or decoder failure); identity bodies never finish (end at connection close).
@@ -300,7 +303,7 @@ with automatic exponential backoff, redirect following, transfer-mode decoding,
 cooperative cancellation, and optional stall detection. Delivers events via
 callbacks set on the client object. Imports `types`, `parser`, `http`,
 `client_shared`. Tested via threaded loopback servers in
-`tests/t_client_async.nim` (1339 lines, 13 suites).
+`tests/t_client_async.nim` (1347 lines, 13 suites).
 
 ### Public API
 
@@ -308,7 +311,9 @@ callbacks set on the client object. Imports `types`, `parser`, `http`,
   — constructor. Validates URL synchronously (spec §6.1 steps 1–3); raises `ValueError`
   on invalid/unsupported URL. No network activity until `connect`.
 - `connect*(client) {.async.}` — main event loop. Runs until `close()` or fatal error.
-  Handles reconnection internally when `autoReconnect` is true.
+  Handles reconnection internally when `autoReconnect` is true. Returns immediately
+  (no network activity) if the client was closed or cancelled before the call —
+  Closed is terminal per spec §6.
 - `close*(client)` — immediate client-initiated close (spec §6.5). Sets `readyState`
   to `Closed`, aborts socket. No error event fired.
 - `lastEventId*(client): string` — read-only accessor (delegates to parser).
@@ -337,7 +342,9 @@ Private state: `parser`, `socket`, `cancelToken`, `consecutiveFailures`,
   reconnection), reads headers incrementally via `HeaderParser`, follows redirects
   (permanent redirects update `client.url`), validates response (status + Content-Type).
   On success: wires parser, resets parser, initializes the `BodyDecoder` from the
-  response headers, feeds any body bytes that arrived with headers.
+  response headers, and stashes any body bytes that arrived with the headers in
+  `pendingBody`; `connect` feeds them to the parser only after `fireOpen` (spec
+  §6.2: the open event precedes any message events).
 - **`readBody`**: Reads the response body in a loop, feeding decoded chunks to the
   parser. Supports `withTimeout` for stall detection; on timeout, closes the socket
   and consumes the orphaned recv future's error to prevent asyncdispatch warnings.
@@ -345,8 +352,9 @@ Private state: `parser`, `socket`, `cancelToken`, `consecutiveFailures`,
 - **`feedBody`**: Delegates transfer-framing removal to `client_shared.BodyDecoder`,
   then feeds decoded bytes to the parser.
 - **`wireParser`**: Connects parser callbacks to client callbacks, injecting `origin`
-  (from the effective/final URL) into each event. Guards delivery on `readyState`
-  (spec §5.1 step 6).
+  (from the effective/final URL) into each event. Guards delivery on `isCancelled`
+  (readyState Closed *or* cancel token fired), implementing spec §5.1 step 6 with
+  token cancellation treated identically to `close()`.
 - **`reconnectDelay`**: Delegates to `client_shared.backoffDelay`
   (`min(base * 2^failures, cap)`). After a successful connection (`fireOpen`),
   `consecutiveFailures` resets to 0, so first reconnect after clean end-of-body
@@ -382,7 +390,104 @@ Private state: `parser`, `socket`, `cancelToken`, `consecutiveFailures`,
 
 ---
 
-## Phase 7 - Sync client (`client_sync.nim`)
+## Phase 7 - Sync client (`client_sync.nim`) ✅
+
+Blocking SSE client implementing the same EventSource state machine as Phase 6
+over `std/net` blocking sockets. Structural mirror of `client_async`: same
+connect → open → read → reconnect lifecycle, exponential backoff, redirect
+following, transfer-mode decoding, and optional stall detection. `connect`
+blocks the calling thread for the entire lifecycle; callbacks fire on that
+thread. Imports `types`, `parser`, `http`, `client_shared`. Tested via
+threaded loopback servers in `tests/t_client_sync.nim` (1434 lines, 13 suites
+— a port of the async suite with the same coverage).
+
+### Public API
+
+- `newSyncSseClient*(rawUrl; config = DefaultSyncConfig; cancelToken = nil): SyncSseClient`
+  — constructor. Validates URL synchronously (spec §6.1 steps 1–3); raises `ValueError`
+  on invalid/unsupported URL. No network activity until `connect`.
+- `connect*(client)` — main loop, blocking. Runs until `close()` (from a callback),
+  the cancel token fires (possibly from another thread), or a fatal error occurs.
+  Handles reconnection internally when `autoReconnect` is true. Returns immediately
+  if the client was closed or cancelled before the call — Closed is terminal per spec §6.
+- `close*(client)` — client-initiated close (spec §6.5). Sets `readyState` to `Closed`;
+  no error event fired. Same-thread only (typically from a callback while `connect`
+  is running); the loop observes it within one `pollInterval` and tears down the
+  socket itself. For cross-thread cancellation, use a `CancelToken`.
+- `lastEventId*(client): string` — read-only accessor (delegates to parser).
+- `reconnectionTime*(client): int` — current reconnection time in ms.
+
+### Configuration
+
+`SyncSseClientConfig` object — same fields as the async config plus two
+sync-only knobs:
+- `autoReconnect` (bool, default `true`) — reconnect on connection loss.
+- `maxRedirects` (int, default `10`) — redirect limit per attempt.
+- `maxReconnectDelay` (int, default `60_000`) — backoff cap in ms.
+- `stallTimeout` (int, default `0`) — inactivity timeout (body only); 0 disables.
+- `recvSize` (int, default `4096`) — per-poll read size cap.
+- `pollInterval` (int, default `250`) — per-recv timeout in ms; bounds how quickly
+  cancellation is observed while blocked in `recv`.
+- `connectTimeout` (int, default `30_000`) — TCP connect timeout in ms (0 = OS
+  default). A blocking connect is not cancellable mid-attempt; this bounds how
+  long it can hold up the loop.
+
+### `SyncSseClient` object
+
+Public fields: `readyState`, `url` (reconnection URL), `config`, `onEvent`,
+`onComment`, `onOpen`, `onError`.
+Private state: `parser`, `socket`, `cancelToken`, `consecutiveFailures`,
+`body` (a `client_shared.BodyDecoder`), `pendingBody`.
+
+### Internal design
+
+- **`ConnectOutcome` / `RecvOutcome` enums**: `coSuccess` / `coRetry` / `coFatal`
+  guide the main loop (as in async); `roData` / `roClosed` / `roStalled` /
+  `roCancelled` classify each `pollRecv` result.
+- **`pollRecv`** — the sync cancellation core. Waits for a single byte with
+  `recv(1, timeout = pollInterval)`, checking `isCancelled` on every wake, then
+  drains already-buffered bytes via the low-level pointer `recv(addr c, 1)` under
+  a `hasDataBuffered` guard (a memcpy from the socket's internal buffer — no
+  syscall, no per-byte string allocation). A larger recv-with-timeout cannot be
+  used: std/net's timeout recv loops to fill the full requested size and raises
+  `TimeoutError` on a partial read, discarding bytes already consumed. Byte-wise
+  drain under `hasDataBuffered` is the only loss-proof shape std/net's public
+  API allows (`bufLen`/`currPos` are private; any larger plain recv can block in
+  `readIntoBuf` when the buffer runs dry). Stall accounting (`idleMs`) accumulates
+  across consecutive timeouts and resets on data.
+- **`attemptConnect`**: Same flow as async — open socket (with `connectTimeout`),
+  send HTTP/1.1 GET (with `Last-Event-ID` on reconnection), read headers via
+  `HeaderParser` (no stall deadline, but cancellable at every `pollInterval`),
+  follow redirects (permanent redirects update `client.url`), validate, stash
+  header-adjacent body bytes in `pendingBody` for delivery after `fireOpen`
+  (spec §6.2).
+- **`readBody`**: Loops on `pollRecv` with `stallTimeout`, feeding decoded chunks
+  to the parser. Calls `parser.complete()` on all non-cancel exit paths (spec §3.5).
+- **`wireParser`**: Identical to async — injects `origin` from the effective/final
+  URL; guards delivery on `isCancelled` (readyState Closed *or* cancel token
+  fired), implementing spec §5.1 step 6 with token cancellation treated
+  identically to `close()`.
+- **`reconnectDelay` / `cancelAwareSleep`**: Delegate to `client_shared.backoffDelay`;
+  sleep wakes every `pollInterval` to check cancellation.
+
+### Key decisions
+
+- **Cancellation is cooperative polling**: A blocking `recv` can't observe a flag,
+  so every socket wait uses a short timeout (`pollInterval`) and re-checks
+  `close()` / the cancel token on each wake. Worst-case cancellation latency is
+  one `pollInterval`.
+- **`close()` does not touch the socket** (unlike async): it only sets `readyState`.
+  The connect loop owns the socket and tears it down on its own thread, avoiding
+  any close-during-recv race. Cross-thread shutdown goes through `CancelToken`
+  (atomic flag); `readyState` itself is not atomic.
+- **Stall detection granularity**: `idleMs` advances in whole `pollInterval` steps,
+  so a stall fires within `stallTimeout` rounded up to the next interval —
+  accepted imprecision for a keep-alive watchdog.
+- **Header phase has no stall deadline** (parity with async); it remains
+  cancellable per poll, and `connectTimeout` bounds the TCP connect itself.
+- Shared with async (same rationale as Phase 6): permanent-redirect URL updates,
+  origin from final URL, no TLS yet (Phase 8 stub in `openSocket`), no
+  `fireError` readyState guard, `parser.reset()` on each successful connect.
 
 ---
 

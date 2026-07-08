@@ -1,5 +1,19 @@
-import std/[unittest, asyncdispatch, net, os, strutils]
-import sse/[types, http, client_async]
+## Port of tests/t_client_async.nim for the sync (blocking) client.
+##
+## Same suites and coverage, minus async plumbing: `connect` is a plain
+## blocking call, so no `waitFor`/`await`. Test bodies are wrapped in a
+## local `proc run()` (as in the async suite) so callback closures capture
+## locals, not module-level globals. Two tests are restructured for the
+## blocking model:
+## - "close during reconnection sleep" closes from the onError callback
+##   (the only same-thread vantage point while `connect` blocks).
+## - "cancel token shared across clients" runs each client on its own
+##   thread and cancels the shared token from the main thread, following
+##   the documented CancelToken lifetime rule (create before spawn, keep
+##   alive until join).
+
+import std/[unittest, net, os, strutils, times]
+import sse/[types, http, client_sync]
 
 # ===========================================================================
 # 1. Construction & URL Validation (spec §6.1 steps 1–3)
@@ -8,7 +22,7 @@ import sse/[types, http, client_async]
 suite "Construction & URL Validation":
 
   test "valid URL creates client in Connecting state with correct URL fields":
-    let c1 = newAsyncSseClient("http://example.com/events")
+    let c1 = newSyncSseClient("http://example.com/events")
     check c1.readyState == Connecting
     check c1.url.scheme == "http"
     check c1.url.host == "example.com"
@@ -16,7 +30,7 @@ suite "Construction & URL Validation":
     check c1.url.path == "/events"
     check c1.url.useTls == false
 
-    let c2 = newAsyncSseClient("https://example.com:8443/stream?t=1")
+    let c2 = newSyncSseClient("https://example.com:8443/stream?t=1")
     check c2.readyState == Connecting
     check c2.url.scheme == "https"
     check c2.url.port == 8443
@@ -24,55 +38,59 @@ suite "Construction & URL Validation":
     check c2.url.path == "/stream?t=1"
 
   test "url serialization normalizes default port away":
-    check $newAsyncSseClient("http://example.com:80/events").url ==
+    check $newSyncSseClient("http://example.com:80/events").url ==
       "http://example.com/events"
-    check $newAsyncSseClient("http://example.com:9090/events").url ==
+    check $newSyncSseClient("http://example.com:9090/events").url ==
       "http://example.com:9090/events"
-    check $newAsyncSseClient("https://example.com:443/x").url ==
+    check $newSyncSseClient("https://example.com:443/x").url ==
       "https://example.com/x"
 
   test "path defaults to / when absent":
-    check newAsyncSseClient("http://example.com").url.path == "/"
+    check newSyncSseClient("http://example.com").url.path == "/"
 
   test "invalid URLs raise ValueError at construction":
     expect(ValueError):
-      discard newAsyncSseClient("")
+      discard newSyncSseClient("")
     expect(ValueError):
-      discard newAsyncSseClient("example.com/events")
+      discard newSyncSseClient("example.com/events")
     expect(ValueError):
-      discard newAsyncSseClient("ftp://example.com/events")
+      discard newSyncSseClient("ftp://example.com/events")
     expect(ValueError):
-      discard newAsyncSseClient("ws://example.com/events")
+      discard newSyncSseClient("ws://example.com/events")
     expect(ValueError):
-      discard newAsyncSseClient("http:///events")
+      discard newSyncSseClient("http:///events")
     expect(ValueError):
-      discard newAsyncSseClient("http://example.com:0/events")
+      discard newSyncSseClient("http://example.com:0/events")
     expect(ValueError):
-      discard newAsyncSseClient("http://example.com:65536/events")
+      discard newSyncSseClient("http://example.com:65536/events")
     expect(ValueError):
-      discard newAsyncSseClient("http://example.com:abc/events")
+      discard newSyncSseClient("http://example.com:abc/events")
 
   test "default config values":
-    let client = newAsyncSseClient("http://example.com/events")
+    let client = newSyncSseClient("http://example.com/events")
     check client.config.autoReconnect == true
     check client.config.maxRedirects == 10
     check client.config.maxReconnectDelay == 60_000
     check client.config.stallTimeout == 0
     check client.config.recvSize == 4096
+    check client.config.pollInterval == 250
+    check client.config.connectTimeout == 30_000
 
   test "custom config is honored":
-    let cfg = AsyncSseClientConfig(
+    let cfg = SyncSseClientConfig(
       autoReconnect: false,
       maxRedirects: 5,
       maxReconnectDelay: 30_000,
       stallTimeout: 10_000,
       recvSize: 8192,
+      pollInterval: 100,
+      connectTimeout: 2_000,
     )
-    let client = newAsyncSseClient("http://example.com/events", config = cfg)
+    let client = newSyncSseClient("http://example.com/events", config = cfg)
     check client.config == cfg
 
   test "initial state: callbacks nil, lastEventId empty, reconnectionTime 3000":
-    let client = newAsyncSseClient("http://example.com/events")
+    let client = newSyncSseClient("http://example.com/events")
     check client.onEvent == nil
     check client.onComment == nil
     check client.onOpen == nil
@@ -82,8 +100,8 @@ suite "Construction & URL Validation":
 
   test "cancel token stored when provided":
     let token = newCancelToken()
-    let client = newAsyncSseClient("http://example.com/events",
-                                   cancelToken = token)
+    let client = newSyncSseClient("http://example.com/events",
+                                  cancelToken = token)
     token.cancel()
     check client.readyState == Connecting
 
@@ -91,12 +109,25 @@ suite "Construction & URL Validation":
 # Test Infrastructure — Threaded Loopback Server
 # ===========================================================================
 
-const NoReconnect = AsyncSseClientConfig(
+# Short pollInterval keeps cancellation/stall checks responsive in tests.
+const NoReconnect = SyncSseClientConfig(
   autoReconnect: false,
   maxRedirects: 10,
   maxReconnectDelay: 60_000,
   stallTimeout: 0,
   recvSize: 4096,
+  pollInterval: 50,
+  connectTimeout: 5_000,
+)
+
+const FastReconnect = SyncSseClientConfig(
+  autoReconnect: true,
+  maxRedirects: 10,
+  maxReconnectDelay: 500,
+  stallTimeout: 0,
+  recvSize: 4096,
+  pollInterval: 50,
+  connectTimeout: 5_000,
 )
 
 proc sseResponse(body: string; contentType = "text/event-stream"): string =
@@ -137,9 +168,9 @@ template withServer(response: string; body: untyped) =
   var thr: Thread[ServerConfig]
   createThread(thr, serveOnce, (port, response))
   sleep(100)
-  proc run() {.async.} =
+  proc run() =
     body
-  waitFor run()
+  run()
   joinThread(thr)
 
 # ===========================================================================
@@ -153,12 +184,12 @@ suite "Successful Connection":
       var opened = false
       var stateAtOpen = Closed
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onOpen = proc() =
         opened = true
         stateAtOpen = client.readyState
 
-      await client.connect()
+      client.connect()
 
       check opened
       check stateAtOpen == Open
@@ -168,10 +199,10 @@ suite "Successful Connection":
     withServer(sseResponse("data: hello world\n\n")):
       var events: seq[SseEvent] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
 
-      await client.connect()
+      client.connect()
 
       check events.len == 1
       check events[0].eventType == "message"
@@ -184,10 +215,10 @@ suite "Successful Connection":
         "data: first\n\ndata: second\n\ndata: third\n\n")):
       var events: seq[SseEvent] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
 
-      await client.connect()
+      client.connect()
 
       check events.len == 3
       check events[0].data == "first"
@@ -199,10 +230,10 @@ suite "Successful Connection":
         "data: line one\ndata: line two\ndata: line three\n\n")):
       var events: seq[SseEvent] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
 
-      await client.connect()
+      client.connect()
 
       check events.len == 1
       check events[0].data == "line one\nline two\nline three"
@@ -214,10 +245,10 @@ suite "Successful Connection":
         "data: plain\n\n")):
       var events: seq[SseEvent] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
 
-      await client.connect()
+      client.connect()
 
       check events.len == 3
       check events[0].eventType == "add"
@@ -233,11 +264,11 @@ suite "Successful Connection":
       var comments: seq[string] = @[]
       var events: seq[SseEvent] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onComment = proc(c: string) = comments.add(c)
       client.onEvent = proc(e: SseEvent) = events.add(e)
 
-      await client.connect()
+      client.connect()
 
       check comments == @[" first comment", " second comment"]
       check events.len == 1
@@ -250,10 +281,10 @@ suite "Successful Connection":
         "id: 3\ndata: third\n\n")):
       var events: seq[SseEvent] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
 
-      await client.connect()
+      client.connect()
 
       check events.len == 3
       check events[0].lastEventId == "1"
@@ -265,10 +296,10 @@ suite "Successful Connection":
     withServer(sseResponse("data: bye\n\n")):
       var errors: seq[string] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check errors.len == 1
       check errors[0] == "stream ended"
@@ -284,11 +315,11 @@ suite "Connection Failure - Fatal":
       var errors: seq[string] = @[]
       var opened = false
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onOpen = proc() = opened = true
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check not opened
       check client.readyState == Closed
@@ -299,10 +330,10 @@ suite "Connection Failure - Fatal":
     withServer("HTTP/1.1 204 No Content\r\n\r\n"):
       var errors: seq[string] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check client.readyState == Closed
       check errors.len == 1
@@ -312,10 +343,10 @@ suite "Connection Failure - Fatal":
     withServer("HTTP/1.1 500 Internal Server Error\r\n\r\n"):
       var errors: seq[string] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check client.readyState == Closed
       check "HTTP 500" in errors[0]
@@ -325,11 +356,11 @@ suite "Connection Failure - Fatal":
       var errors: seq[string] = @[]
       var opened = false
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onOpen = proc() = opened = true
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check not opened
       check client.readyState == Closed
@@ -339,10 +370,10 @@ suite "Connection Failure - Fatal":
     withServer(sseResponse("data: ok\n\n", contentType = "text/event-stream; charset=utf-8")):
       var events: seq[SseEvent] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
 
-      await client.connect()
+      client.connect()
 
       check events.len == 1
       check events[0].data == "ok"
@@ -351,10 +382,10 @@ suite "Connection Failure - Fatal":
     withServer("HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream\r\n\r\ndata: ok\n\n"):
       var events: seq[SseEvent] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
 
-      await client.connect()
+      client.connect()
 
       check events.len == 1
       check events[0].data == "ok"
@@ -363,10 +394,10 @@ suite "Connection Failure - Fatal":
     withServer("HTTP/1.1 404 Not Found\r\n\r\n"):
       var errors: seq[string] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = DefaultConfig)
+      let client = newSyncSseClient(clientUrl(port), config = DefaultSyncConfig)
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check client.readyState == Closed
       check errors.len == 1
@@ -410,49 +441,41 @@ template withMultiServer(responses: openArray[string]; body: untyped) =
   var thr: Thread[MultiServerConfig]
   createThread(thr, serveMulti, multiCfg(port, responses))
   sleep(100)
-  proc run() {.async.} =
+  proc run() =
     body
-  waitFor run()
+  run()
   joinThread(thr)
 
 # ===========================================================================
 # 4. Connection Failure — Retryable
 # ===========================================================================
 
-const FastNoReconnect = AsyncSseClientConfig(
-  autoReconnect: false,
-  maxRedirects: 10,
-  maxReconnectDelay: 60_000,
-  stallTimeout: 0,
-  recvSize: 4096,
-)
-
 suite "Connection Failure - Retryable":
 
   test "connection refused (no listener) with autoReconnect false":
     let port = findFreePort()
-    proc run() {.async.} =
+    proc run() =
       var errors: seq[string] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = FastNoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check client.readyState == Closed
       check errors.len == 1
       check "connection failed" in errors[0]
 
-    waitFor run()
+    run()
 
   test "server accepts then closes immediately (0-byte recv)":
     withMultiServer(@[""]):
       var errors: seq[string] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = FastNoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check client.readyState == Closed
       check errors.len == 1
@@ -462,10 +485,10 @@ suite "Connection Failure - Retryable":
     withMultiServer(@["HTTP/1.1 200 OK\r\nContent-"]):
       var errors: seq[string] = @[]
 
-      let client = newAsyncSseClient(clientUrl(port), config = FastNoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check client.readyState == Closed
       check errors.len == 1
@@ -478,19 +501,12 @@ suite "Connection Failure - Retryable":
       [sseResponse("data: first\n\n"), sseResponse("data: second\n\n")]))
     sleep(100)
 
-    proc runRetryTest() {.async.} =
+    proc runRetryTest() =
       var errors: seq[string] = @[]
       var events: seq[SseEvent] = @[]
       var openCount = 0
 
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true,
-        maxRedirects: 10,
-        maxReconnectDelay: 500,
-        stallTimeout: 0,
-        recvSize: 4096,
-      )
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
+      let client = newSyncSseClient(clientUrl(port), config = FastReconnect)
       client.onOpen = proc() =
         inc openCount
         if openCount >= 2:
@@ -498,7 +514,7 @@ suite "Connection Failure - Retryable":
       client.onError = proc(msg: string) = errors.add(msg)
       client.onEvent = proc(e: SseEvent) = events.add(e)
 
-      await client.connect()
+      client.connect()
 
       check openCount >= 2
       check events.len >= 1
@@ -506,7 +522,7 @@ suite "Connection Failure - Retryable":
       check errors.len >= 1
       check "reconnecting" in errors[0]
 
-    waitFor runRetryTest()
+    runRetryTest()
     joinThread(thr)
 
 # ===========================================================================
@@ -548,24 +564,21 @@ suite "Reconnection Behavior":
        sseResponse("data: second\n\n")]))
     sleep(100)
 
-    proc run() {.async.} =
+    proc run() =
       var events: seq[SseEvent] = @[]
       var openCount = 0
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 500, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
+      let client = newSyncSseClient(clientUrl(port), config = FastReconnect)
       client.onOpen = proc() =
         inc openCount
         if openCount >= 2: client.close()
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
 
       check events.len >= 1
       check events[0].lastEventId == "42"
       check client.lastEventId == "42"
 
-    waitFor run()
+    run()
     joinThread(thr)
 
   test "Last-Event-ID header sent on reconnection":
@@ -580,18 +593,15 @@ suite "Reconnection Behavior":
     createThread(thr, serveCaptureMulti, cfg)
     sleep(100)
 
-    proc run() {.async.} =
+    proc run() =
       var openCount = 0
-      let clientCfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 500, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = clientCfg)
+      let client = newSyncSseClient(clientUrl(port), config = FastReconnect)
       client.onOpen = proc() =
         inc openCount
         if openCount >= 2: client.close()
-      await client.connect()
+      client.connect()
 
-    waitFor run()
+    run()
     joinThread(thr)
 
     check "Last-Event-ID" notin reqBuf[0]
@@ -599,9 +609,9 @@ suite "Reconnection Behavior":
 
   test "server retry field updates reconnectionTime":
     withServer(sseResponse("retry: 5000\ndata: hi\n\n")):
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = discard
-      await client.connect()
+      client.connect()
       check client.reconnectionTime == 5000
 
   test "reconnection fires error event with reconnecting message":
@@ -612,23 +622,20 @@ suite "Reconnection Behavior":
        sseResponse("data: second\n\n")]))
     sleep(100)
 
-    proc run() {.async.} =
+    proc run() =
       var errors: seq[string] = @[]
       var openCount = 0
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 500, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
+      let client = newSyncSseClient(clientUrl(port), config = FastReconnect)
       client.onOpen = proc() =
         inc openCount
         if openCount >= 2: client.close()
       client.onError = proc(msg: string) = errors.add(msg)
-      await client.connect()
+      client.connect()
 
       check errors.len >= 1
       check "connection lost" in errors[0] or "reconnecting" in errors[0]
 
-    waitFor run()
+    run()
     joinThread(thr)
 
   test "readyState transitions: Open → Connecting on reconnect":
@@ -638,32 +645,27 @@ suite "Reconnection Behavior":
       [sseResponse("data: a\n\n"), sseResponse("data: b\n\n")]))
     sleep(100)
 
-    proc run() {.async.} =
+    proc run() =
       var states: seq[ReadyState] = @[]
       var openCount = 0
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 500, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
+      let client = newSyncSseClient(clientUrl(port), config = FastReconnect)
       client.onOpen = proc() =
         states.add(client.readyState)
         inc openCount
         if openCount >= 2: client.close()
       client.onError = proc(msg: string) =
         states.add(client.readyState)
-      await client.connect()
+      client.connect()
 
       check Open in states
       check Connecting in states
 
-    waitFor run()
+    run()
     joinThread(thr)
 
 # ===========================================================================
 # 6. Exponential Backoff
 # ===========================================================================
-
-import std/times
 
 suite "Exponential Backoff":
 
@@ -675,26 +677,32 @@ suite "Exponential Backoff":
        sseResponse("data: second\n\n")]))
     sleep(100)
 
-    proc run() {.async.} =
+    proc run() =
       var openCount = 0
       var t0, t1: float
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 60_000, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
+      let cfg = SyncSseClientConfig(
+        autoReconnect: true,
+        maxRedirects: 10,
+        maxReconnectDelay: 60_000,
+        stallTimeout: 0,
+        recvSize: 4096,
+        pollInterval: 50,
+        connectTimeout: 5_000,
+      )
+      let client = newSyncSseClient(clientUrl(port), config = cfg)
       client.onOpen = proc() =
         inc openCount
         if openCount == 1: t0 = epochTime()
         elif openCount == 2:
           t1 = epochTime()
           client.close()
-      await client.connect()
+      client.connect()
 
       let elapsed = (t1 - t0) * 1000
       check elapsed < 2000
       check client.reconnectionTime == 100
 
-    waitFor run()
+    run()
     joinThread(thr)
 
   test "maxReconnectDelay caps backoff":
@@ -705,26 +713,32 @@ suite "Exponential Backoff":
        sseResponse("data: second\n\n")]))
     sleep(100)
 
-    proc run() {.async.} =
+    proc run() =
       var openCount = 0
       var t0, t1: float
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 200, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
+      let cfg = SyncSseClientConfig(
+        autoReconnect: true,
+        maxRedirects: 10,
+        maxReconnectDelay: 200,
+        stallTimeout: 0,
+        recvSize: 4096,
+        pollInterval: 50,
+        connectTimeout: 5_000,
+      )
+      let client = newSyncSseClient(clientUrl(port), config = cfg)
       client.onOpen = proc() =
         inc openCount
         if openCount == 1: t0 = epochTime()
         elif openCount == 2:
           t1 = epochTime()
           client.close()
-      await client.connect()
+      client.connect()
 
       let elapsed = (t1 - t0) * 1000
       check elapsed < 2000
       check client.reconnectionTime == 50000
 
-    waitFor run()
+    run()
     joinThread(thr)
 
   test "consecutiveFailures resets after successful connection":
@@ -736,14 +750,20 @@ suite "Exponential Backoff":
        sseResponse("data: c\n\n")]))
     sleep(100)
 
-    proc run() {.async.} =
+    proc run() =
       var openCount = 0
       var reconnectTimes: seq[float] = @[]
       var lastClose: float
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 60_000, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
+      let cfg = SyncSseClientConfig(
+        autoReconnect: true,
+        maxRedirects: 10,
+        maxReconnectDelay: 60_000,
+        stallTimeout: 0,
+        recvSize: 4096,
+        pollInterval: 50,
+        connectTimeout: 5_000,
+      )
+      let client = newSyncSseClient(clientUrl(port), config = cfg)
       client.onOpen = proc() =
         inc openCount
         if openCount > 1:
@@ -752,13 +772,13 @@ suite "Exponential Backoff":
       client.onError = proc(msg: string) =
         if "reconnecting" in msg:
           lastClose = epochTime()
-      await client.connect()
+      client.connect()
 
       check openCount >= 3
       for t in reconnectTimes:
         check t < 2000
 
-    waitFor run()
+    run()
     joinThread(thr)
 
 # ===========================================================================
@@ -780,15 +800,15 @@ suite "Redirects":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
     sleep(100)
-    proc run301() {.async.} =
+    proc run301() =
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port, "/old"), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port, "/old"), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
       check events[0].data == "redirected"
       check client.url.path == "/new-path"
-    waitFor run301()
+    run301()
     joinThread(thr)
 
   test "307 redirect followed but does NOT update client.url":
@@ -798,15 +818,15 @@ suite "Redirects":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
     sleep(100)
-    proc run307() {.async.} =
+    proc run307() =
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port, "/original"), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port, "/original"), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
       check events[0].data == "temp-ok"
       check client.url.path == "/original"
-    waitFor run307()
+    run307()
     joinThread(thr)
 
   test "308 redirect updates client.url permanently":
@@ -816,14 +836,14 @@ suite "Redirects":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
     sleep(100)
-    proc run308() {.async.} =
+    proc run308() =
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port, "/old"), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port, "/old"), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
       check client.url.path == "/perm"
-    waitFor run308()
+    run308()
     joinThread(thr)
 
   test "multiple redirects in a chain":
@@ -834,14 +854,14 @@ suite "Redirects":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
     sleep(100)
-    proc runChain() {.async.} =
+    proc runChain() =
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
       check events[0].data == "final"
-    waitFor runChain()
+    runChain()
     joinThread(thr)
 
   test "exceeding maxRedirects causes fatal error":
@@ -852,35 +872,41 @@ suite "Redirects":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
     sleep(100)
-    proc runMaxRedir() {.async.} =
+    proc runMaxRedir() =
       var errors: seq[string] = @[]
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: false, maxRedirects: 2,
-        maxReconnectDelay: 60_000, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
+      let cfg = SyncSseClientConfig(
+        autoReconnect: false,
+        maxRedirects: 2,
+        maxReconnectDelay: 60_000,
+        stallTimeout: 0,
+        recvSize: 4096,
+        pollInterval: 50,
+        connectTimeout: 5_000,
+      )
+      let client = newSyncSseClient(clientUrl(port), config = cfg)
       client.onError = proc(msg: string) = errors.add(msg)
-      await client.connect()
+      client.connect()
       check client.readyState == Closed
       check errors.len == 1
       check "too many redirects" in errors[0]
-    waitFor runMaxRedir()
+    runMaxRedir()
     joinThread(thr)
 
   test "redirect with no Location header causes fatal error":
     withServer("HTTP/1.1 301 Moved\r\nContent-Length: 0\r\n\r\n"):
       var errors: seq[string] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onError = proc(msg: string) = errors.add(msg)
-      await client.connect()
+      client.connect()
       check client.readyState == Closed
       check "no Location" in errors[0]
 
   test "redirect with invalid Location causes fatal error":
     withServer(redirectResponse(301, "://invalid")):
       var errors: seq[string] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onError = proc(msg: string) = errors.add(msg)
-      await client.connect()
+      client.connect()
       check client.readyState == Closed
       check errors.len == 1
 
@@ -891,14 +917,14 @@ suite "Redirects":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
     sleep(100)
-    proc runOrigin() {.async.} =
+    proc runOrigin() =
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port, "/start"), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port, "/start"), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
       check events[0].origin == "http://127.0.0.1:" & $port
-    waitFor runOrigin()
+    runOrigin()
     joinThread(thr)
 
 # ===========================================================================
@@ -933,8 +959,8 @@ suite "close()":
 
   test "close sets readyState to Closed and connect returns":
     withServer(sseResponse("data: hi\n\n")):
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
-      await client.connect()
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
+      client.connect()
       check client.readyState == Closed
       client.close()
       check client.readyState == Closed
@@ -947,27 +973,30 @@ suite "close()":
       headers: "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" &
                "data: first\n\n",
       body: "data: late\n\n",
-      delayMs: 10000)
+      delayMs: 3000)
     createThread(thr, serveSlowBody, cfg)
     sleep(200)
 
-    proc runClose() {.async.} =
+    proc runClose() =
       var events: seq[SseEvent] = @[]
       var errors: seq[string] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) =
         events.add(e)
         client.close()
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      let t0 = epochTime()
+      client.connect()
+      let elapsed = (epochTime() - t0) * 1000
 
       check client.readyState == Closed
       check errors.len == 0
       check events.len >= 1
       check events[0].data == "first"
+      check elapsed < 2000
 
-    waitFor runClose()
+    runClose()
     joinThread(thr)
 
   test "no onError fired on close":
@@ -978,72 +1007,96 @@ suite "close()":
       headers: "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" &
                "data: hello\n\n",
       body: "",
-      delayMs: 10000)
+      delayMs: 3000)
     createThread(thr, serveSlowBody, cfg)
     sleep(200)
 
-    proc runNoError() {.async.} =
+    proc runNoError() =
       var errors: seq[string] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = DefaultConfig)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onError = proc(msg: string) = errors.add(msg)
       client.onEvent = proc(e: SseEvent) =
         client.close()
 
-      await client.connect()
+      client.connect()
       check errors.len == 0
 
-    waitFor runNoError()
+    runNoError()
     joinThread(thr)
 
-  test "close during reconnection sleep exits quickly":
+  test "close from onError during reconnection sleep exits quickly":
+    # Sync rework of the async "close during reconnection sleep" test:
+    # with a blocking connect, the only same-thread vantage point during
+    # the backoff sleep is a callback, so close() is issued from onError
+    # (fired when reconnection begins). The default reconnectionTime is
+    # 3000ms; a prompt exit proves the sleep observed the closed state.
     let port = findFreePort()
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("data: hi\n\n")]))
     sleep(100)
 
-    proc runCloseReconn() {.async.} =
+    proc runCloseReconn() =
       var errorFired = false
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 60_000, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
-      client.onError = proc(msg: string) = errorFired = true
-
-      let connectFut = client.connect()
-      await sleepAsync(500)
-      check errorFired
-      check client.readyState == Connecting
+      var stateAtError = Closed
+      let cfg = SyncSseClientConfig(
+        autoReconnect: true,
+        maxRedirects: 10,
+        maxReconnectDelay: 60_000,
+        stallTimeout: 0,
+        recvSize: 4096,
+        pollInterval: 50,
+        connectTimeout: 5_000,
+      )
+      let client = newSyncSseClient(clientUrl(port), config = cfg)
+      client.onError = proc(msg: string) =
+        errorFired = true
+        stateAtError = client.readyState
+        client.close()
 
       let t0 = epochTime()
-      client.close()
-      await connectFut
+      client.connect()
       let elapsed = (epochTime() - t0) * 1000
 
+      check errorFired
+      check stateAtError == Connecting
       check client.readyState == Closed
-      check elapsed < 1000
+      check elapsed < 2000
 
-    waitFor runCloseReconn()
+    runCloseReconn()
     joinThread(thr)
 
   test "close when already Closed is a no-op":
-    proc runNoop() {.async.} =
-      let port = findFreePort()
-      var thr: Thread[ServerConfig]
-      createThread(thr, serveOnce, (port, sseResponse("data: x\n\n")))
-      sleep(100)
-      let c = newAsyncSseClient(clientUrl(port), config = NoReconnect)
-      await c.connect()
+    let port = findFreePort()
+    var thr: Thread[ServerConfig]
+    createThread(thr, serveOnce, (port, sseResponse("data: x\n\n")))
+    sleep(100)
+    proc runNoop() =
+      let c = newSyncSseClient(clientUrl(port), config = NoReconnect)
+      c.connect()
       check c.readyState == Closed
       c.close()
       check c.readyState == Closed
-      joinThread(thr)
-
-    waitFor runNoop()
+    runNoop()
+    joinThread(thr)
 
 # ===========================================================================
 # 9. CancelToken
 # ===========================================================================
+
+# Runner for the cross-thread test: the client lives entirely on its own
+# thread; only the (atomic) token and a result pointer cross threads.
+type ThreadClientCfg = object
+  url: string
+  token: CancelToken
+  finalState: ptr ReadyState
+
+proc runClientThread(cfg: ThreadClientCfg) {.thread.} =
+  let client = newSyncSseClient(cfg.url, config = NoReconnect,
+                                cancelToken = cfg.token)
+  client.onEvent = proc(e: SseEvent) = discard
+  client.connect()
+  cfg.finalState[] = client.readyState
 
 suite "CancelToken":
 
@@ -1055,67 +1108,77 @@ suite "CancelToken":
       headers: "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" &
                "data: ping\n\n",
       body: "",
-      delayMs: 10000)
+      delayMs: 3000)
     createThread(thr, serveSlowBody, cfg)
     sleep(200)
 
-    proc runCancel() {.async.} =
+    proc runCancel() =
       var events: seq[SseEvent] = @[]
       var errors: seq[string] = @[]
       let token = newCancelToken()
-      let client = newAsyncSseClient(clientUrl(port),
-                                     config = NoReconnect, cancelToken = token)
+      let client = newSyncSseClient(clientUrl(port),
+                                    config = NoReconnect, cancelToken = token)
       client.onEvent = proc(e: SseEvent) =
         events.add(e)
         token.cancel()
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check client.readyState == Closed
       check events.len >= 1
       check errors.len == 0
 
-    waitFor runCancel()
+    runCancel()
     joinThread(thr)
 
-  test "cancel token shared across clients cancels all":
+  test "cancel token cancelled from another thread (shared across clients)":
+    # Sync rework of the async "shared across clients" test: blocking
+    # clients each need their own thread, and the main thread cancels
+    # the shared token — the documented cross-thread usage pattern
+    # (token created before spawn, kept alive until join).
     let port1 = findFreePort()
     let port2 = findFreePort()
-    var thr1: Thread[SlowServerConfig]
-    var thr2: Thread[SlowServerConfig]
-    let cfg1 = SlowServerConfig(port: port1,
+    var srv1: Thread[SlowServerConfig]
+    var srv2: Thread[SlowServerConfig]
+    let scfg1 = SlowServerConfig(port: port1,
       headers: "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" &
                "data: a\n\n",
-      body: "", delayMs: 10000)
-    let cfg2 = SlowServerConfig(port: port2,
+      body: "", delayMs: 3000)
+    let scfg2 = SlowServerConfig(port: port2,
       headers: "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" &
                "data: b\n\n",
-      body: "", delayMs: 10000)
-    createThread(thr1, serveSlowBody, cfg1)
-    createThread(thr2, serveSlowBody, cfg2)
+      body: "", delayMs: 3000)
+    createThread(srv1, serveSlowBody, scfg1)
+    createThread(srv2, serveSlowBody, scfg2)
     sleep(200)
 
-    proc runShared() {.async.} =
-      let token = newCancelToken()
-      let c1 = newAsyncSseClient(clientUrl(port1),
-                                  config = NoReconnect, cancelToken = token)
-      let c2 = newAsyncSseClient(clientUrl(port2),
-                                  config = NoReconnect, cancelToken = token)
-      c1.onEvent = proc(e: SseEvent) = token.cancel()
-      c2.onEvent = proc(e: SseEvent) = token.cancel()
+    var state1, state2: ReadyState
+    let token = newCancelToken()
+    var cli1: Thread[ThreadClientCfg]
+    var cli2: Thread[ThreadClientCfg]
+    createThread(cli1, runClientThread,
+      ThreadClientCfg(url: clientUrl(port1), token: token,
+                      finalState: addr state1))
+    createThread(cli2, runClientThread,
+      ThreadClientCfg(url: clientUrl(port2), token: token,
+                      finalState: addr state2))
 
-      let f1 = c1.connect()
-      let f2 = c2.connect()
-      await f1
-      await f2
+    # Let both clients connect and block in their read loops, then
+    # cancel from this thread.
+    sleep(500)
+    let t0 = epochTime()
+    token.cancel()
+    joinThread(cli1)
+    joinThread(cli2)
+    let elapsed = (epochTime() - t0) * 1000
 
-      check c1.readyState == Closed
-      check c2.readyState == Closed
+    check state1 == Closed
+    check state2 == Closed
+    check elapsed < 2000
 
-    waitFor runShared()
-    joinThread(thr1)
-    joinThread(thr2)
+    joinThread(srv1)
+    joinThread(srv2)
 
   test "cancel during reconnection sleep":
     let port = findFreePort()
@@ -1124,24 +1187,30 @@ suite "CancelToken":
       [sseResponse("data: hi\n\n")]))
     sleep(100)
 
-    proc runCancelReconn() {.async.} =
+    proc runCancelReconn() =
       let token = newCancelToken()
       var openCount = 0
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 60_000, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port),
-                                     config = cfg, cancelToken = token)
+      let cfg = SyncSseClientConfig(
+        autoReconnect: true,
+        maxRedirects: 10,
+        maxReconnectDelay: 60_000,
+        stallTimeout: 0,
+        recvSize: 4096,
+        pollInterval: 50,
+        connectTimeout: 5_000,
+      )
+      let client = newSyncSseClient(clientUrl(port),
+                                    config = cfg, cancelToken = token)
       client.onOpen = proc() = inc openCount
       client.onError = proc(msg: string) =
         token.cancel()
 
-      await client.connect()
+      client.connect()
 
       check client.readyState == Closed
       check openCount == 1
 
-    waitFor runCancelReconn()
+    runCancelReconn()
     joinThread(thr)
 
 # ===========================================================================
@@ -1162,31 +1231,37 @@ suite "Stall Timeout":
     createThread(thr, serveSlowBody, cfg)
     sleep(200)
 
-    proc runStall() {.async.} =
+    proc runStall() =
       var events: seq[SseEvent] = @[]
       var errors: seq[string] = @[]
-      let stallCfg = AsyncSseClientConfig(
-        autoReconnect: false, maxRedirects: 10,
-        maxReconnectDelay: 60_000, stallTimeout: 800, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = stallCfg)
+      let stallCfg = SyncSseClientConfig(
+        autoReconnect: false,
+        maxRedirects: 10,
+        maxReconnectDelay: 60_000,
+        stallTimeout: 800,
+        recvSize: 4096,
+        pollInterval: 50,
+        connectTimeout: 5_000,
+      )
+      let client = newSyncSseClient(clientUrl(port), config = stallCfg)
       client.onEvent = proc(e: SseEvent) = events.add(e)
       client.onError = proc(msg: string) = errors.add(msg)
 
-      await client.connect()
+      client.connect()
 
       check events.len >= 1
       check events[0].data == "hello"
       check client.readyState == Closed
 
-    waitFor runStall()
+    runStall()
     joinThread(thr)
 
   test "stall timeout zero means no timeout (default)":
     withServer(sseResponse("data: ok\n\n")):
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
 
   test "stall timeout with autoReconnect triggers reconnection":
@@ -1196,19 +1271,25 @@ suite "Stall Timeout":
       [sseResponse("data: first\n\n"), sseResponse("data: second\n\n")]))
     sleep(100)
 
-    proc runStallReconn() {.async.} =
+    proc runStallReconn() =
       var openCount = 0
-      let stallCfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 100, stallTimeout: 300, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = stallCfg)
+      let stallCfg = SyncSseClientConfig(
+        autoReconnect: true,
+        maxRedirects: 10,
+        maxReconnectDelay: 100,
+        stallTimeout: 300,
+        recvSize: 4096,
+        pollInterval: 50,
+        connectTimeout: 5_000,
+      )
+      let client = newSyncSseClient(clientUrl(port), config = stallCfg)
       client.onOpen = proc() =
         inc openCount
         if openCount >= 2: client.close()
-      await client.connect()
+      client.connect()
       check openCount >= 2
 
-    waitFor runStallReconn()
+    runStallReconn()
     joinThread(thr)
 
 # ===========================================================================
@@ -1225,9 +1306,9 @@ suite "Transfer Modes":
                "\r\n" & chunkedBody
     withServer(resp):
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
       check events[0].data == "hi"
 
@@ -1239,18 +1320,18 @@ suite "Transfer Modes":
                "\r\n" & body
     withServer(resp):
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
       check events[0].data == "hello"
 
   test "identity transfer (no headers) reads until close":
     withServer(sseResponse("data: one\n\ndata: two\n\n")):
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 2
 
 # ===========================================================================
@@ -1263,18 +1344,18 @@ suite "Parser Integration":
     let bom = "\xEF\xBB\xBF"
     withServer(sseResponse(bom & "data: after bom\n\n")):
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
       check events[0].data == "after bom"
 
   test "id with no value resets lastEventId to empty":
     withServer(sseResponse("id: 5\ndata: a\n\nid\ndata: b\n\n")):
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events[0].lastEventId == "5"
       check events[1].lastEventId == ""
       check client.lastEventId == ""
@@ -1282,9 +1363,9 @@ suite "Parser Integration":
   test "incomplete event at end-of-stream is discarded":
     withServer(sseResponse("data: complete\n\ndata: incomplete")):
       var events: seq[SseEvent] = @[]
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = events.add(e)
-      await client.connect()
+      client.connect()
       check events.len == 1
       check events[0].data == "complete"
 
@@ -1296,13 +1377,19 @@ suite "Parser Integration":
        sseResponse("data: fresh\n\n")]))
     sleep(100)
 
-    proc runReset() {.async.} =
+    proc runReset() =
       var events: seq[SseEvent] = @[]
       var errorCount = 0
-      let cfg = AsyncSseClientConfig(
-        autoReconnect: true, maxRedirects: 10,
-        maxReconnectDelay: 100, stallTimeout: 0, recvSize: 4096)
-      let client = newAsyncSseClient(clientUrl(port), config = cfg)
+      let cfg = SyncSseClientConfig(
+        autoReconnect: true,
+        maxRedirects: 10,
+        maxReconnectDelay: 100,
+        stallTimeout: 0,
+        recvSize: 4096,
+        pollInterval: 50,
+        connectTimeout: 5_000,
+      )
+      let client = newSyncSseClient(clientUrl(port), config = cfg)
       # Close from onEvent, not onOpen: closing in onOpen would (correctly,
       # per spec §5.1 step 6) suppress delivery of the very event this test
       # asserts on. If parser.reset failed to clear the stale "data: partial"
@@ -1315,12 +1402,12 @@ suite "Parser Integration":
         # further reconnect attempts are refused and would loop forever).
         inc errorCount
         if errorCount >= 5: client.close()
-      await client.connect()
+      client.connect()
 
       check events.len >= 1
       check events[0].data == "fresh"
 
-    waitFor runReset()
+    runReset()
     joinThread(thr)
 
 # ===========================================================================
@@ -1331,16 +1418,16 @@ suite "Accessors":
 
   test "lastEventId reflects parser state":
     withServer(sseResponse("id: abc\ndata: hello\n\n")):
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = discard
       check client.lastEventId == ""
-      await client.connect()
+      client.connect()
       check client.lastEventId == "abc"
 
   test "reconnectionTime reflects parser state including server retry":
     withServer(sseResponse("retry: 7500\ndata: hi\n\n")):
-      let client = newAsyncSseClient(clientUrl(port), config = NoReconnect)
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
       client.onEvent = proc(e: SseEvent) = discard
       check client.reconnectionTime == 3000
-      await client.connect()
+      client.connect()
       check client.reconnectionTime == 7500

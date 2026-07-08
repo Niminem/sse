@@ -27,6 +27,11 @@ proc initBodyDecoder*(resp: HttpResponse): BodyDecoder =
   if result.mode == tmChunked:
     result.chunked = initChunkedDecoder()
   result.remaining = contentLength(resp)
+  if result.mode == tmContentLength and result.remaining < 0:
+    # Content-Length header present but unparsable: fall back to identity
+    # (read until connection close) rather than treating the body as
+    # already finished, which would put the client in a reconnect loop.
+    result.mode = tmIdentity
 
 proc decode*(dec: var BodyDecoder; raw: string): string =
   ## Decode raw socket bytes, returning body bytes with any transfer

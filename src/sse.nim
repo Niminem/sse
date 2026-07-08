@@ -8,6 +8,7 @@ import sse/writer
 import sse/server
 import sse/http
 import sse/client_async
+import sse/client_sync
 
 export types
 export parser
@@ -15,3 +16,4 @@ export writer
 export server
 export http
 export client_async
+export client_sync

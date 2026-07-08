@@ -1,14 +1,21 @@
-## Async SSE client implementing the EventSource connection lifecycle.
+## Sync (blocking) SSE client implementing the EventSource connection
+## lifecycle.
 ##
 ## Manages the full state machine: connect → open → read → reconnect,
 ## with automatic exponential backoff, redirect following, and optional
-## stall detection. Delivers events via callbacks set on the client object.
+## stall detection. Delivers events via callbacks set on the client
+## object. Structural mirror of `client_async`; the parser, HTTP, and
+## shared client-logic layers are pure (no I/O) and imported from
+## sibling modules (`parser`, `http`, `client_shared`).
 ##
-## Uses std/asyncdispatch + std/asyncnet for non-blocking I/O. The parser,
-## HTTP, and shared client-logic layers are pure (no I/O) and imported
-## from sibling modules (`parser`, `http`, `client_shared`).
+## Uses std/net blocking sockets. `connect` blocks the calling thread
+## for the entire connection lifecycle; callbacks fire on that thread.
+## Cancellation is cooperative: every socket read uses a short timeout
+## (`pollInterval`) so the loop can observe `close()` (same thread, from
+## a callback) or a `CancelToken` (from another thread) without staying
+## blocked in `recv`.
 
-import std/[asyncdispatch, asyncnet]
+import std/[net, os]
 import types, parser, http, client_shared
 
 # ---------------------------------------------------------------------------
@@ -16,8 +23,8 @@ import types, parser, http, client_shared
 # ---------------------------------------------------------------------------
 
 type
-  AsyncSseClientConfig* = object
-    ## Configuration for the async SSE client.
+  SyncSseClientConfig* = object
+    ## Configuration for the sync SSE client.
     autoReconnect*: bool      ## Reconnect on connection loss (spec-compliant).
                               ## Set false for single-shot streams.
     maxRedirects*: int        ## Maximum redirects per connection attempt.
@@ -27,14 +34,19 @@ type
                               ## header-read phase has no deadline (but
                               ## remains cancellable).
     recvSize*: int            ## Socket recv buffer size hint in bytes.
+    pollInterval*: int        ## Per-recv timeout in ms; bounds how quickly
+                              ## cancellation is observed while blocked.
+    connectTimeout*: int      ## TCP connect timeout in ms (0 = OS default).
 
 const
-  DefaultConfig* = AsyncSseClientConfig(
+  DefaultSyncConfig* = SyncSseClientConfig(
     autoReconnect: true,
     maxRedirects: 10,
     maxReconnectDelay: 60_000,
     stallTimeout: 0,
     recvSize: 4096,
+    pollInterval: 250,
+    connectTimeout: 30_000,
   )
 
 # ---------------------------------------------------------------------------
@@ -47,17 +59,24 @@ type
     coRetry    ## Non-fatal failure; should reconnect.
     coFatal    ## Fatal failure; connection is closed permanently.
 
-  AsyncSseClient* = ref object
-    ## An async SSE connection with automatic reconnection.
+  RecvOutcome = enum
+    roData       ## Bytes received.
+    roClosed     ## Connection closed or socket error (end-of-body).
+    roStalled    ## No bytes within the stall timeout.
+    roCancelled  ## close() or cancel token observed.
+
+  SyncSseClient* = ref object
+    ## A blocking SSE connection with automatic reconnection.
     ##
     ## Set callbacks (`onEvent`, `onOpen`, `onError`, `onComment`) before
-    ## calling `connect`. The `connect` future runs until `close()` is
-    ## called or a fatal (non-recoverable) error occurs.
+    ## calling `connect`. The `connect` call blocks until `close()` is
+    ## called, the cancel token fires, or a fatal (non-recoverable) error
+    ## occurs.
 
     # -- Public state --
     readyState*: ReadyState
     url*: SseUrl              ## Reconnection URL (updated only by permanent redirects).
-    config*: AsyncSseClientConfig
+    config*: SyncSseClientConfig
 
     # -- Callbacks --
     onEvent*: SseEventHandler
@@ -67,7 +86,7 @@ type
 
     # -- Private --
     parser: SseParser
-    socket: AsyncSocket
+    socket: Socket
     cancelToken: CancelToken
     consecutiveFailures: int
     body: BodyDecoder
@@ -80,16 +99,16 @@ type
 # Constructor
 # ---------------------------------------------------------------------------
 
-proc newAsyncSseClient*(rawUrl: string;
-                        config = DefaultConfig;
-                        cancelToken: CancelToken = nil): AsyncSseClient =
-  ## Create a new async SSE client.
+proc newSyncSseClient*(rawUrl: string;
+                       config = DefaultSyncConfig;
+                       cancelToken: CancelToken = nil): SyncSseClient =
+  ## Create a new sync SSE client.
   ##
   ## Validates the URL synchronously (spec §6.1 steps 1–3). Raises
   ## `ValueError` if the URL is invalid or uses an unsupported scheme.
   ## No network activity occurs until `connect` is called.
   let parsedUrl = parseSseUrl(rawUrl)
-  result = AsyncSseClient(
+  result = SyncSseClient(
     readyState: Connecting,
     url: parsedUrl,
     config: config,
@@ -101,7 +120,7 @@ proc newAsyncSseClient*(rawUrl: string;
 # Internal: Cancellation Check
 # ---------------------------------------------------------------------------
 
-proc isCancelled(client: AsyncSseClient): bool =
+proc isCancelled(client: SyncSseClient): bool =
   client.readyState == Closed or
     (client.cancelToken != nil and client.cancelToken.cancelled)
 
@@ -109,7 +128,7 @@ proc isCancelled(client: AsyncSseClient): bool =
 # Internal: Callback Wiring
 # ---------------------------------------------------------------------------
 
-proc wireParser(client: AsyncSseClient; effectiveUrl: SseUrl) =
+proc wireParser(client: SyncSseClient; effectiveUrl: SseUrl) =
   ## Wire the parser's callbacks to the client's callbacks, injecting
   ## the origin into each event (spec §5.1 step 4). The isCancelled guard
   ## implements the delivery-time check of spec §5.1 step 6: a callback
@@ -131,14 +150,14 @@ proc wireParser(client: AsyncSseClient; effectiveUrl: SseUrl) =
 # Internal: Fire Lifecycle Events
 # ---------------------------------------------------------------------------
 
-proc fireOpen(client: AsyncSseClient) =
+proc fireOpen(client: SyncSseClient) =
   if client.isCancelled: return
   client.readyState = Open
   client.consecutiveFailures = 0
   if client.onOpen != nil:
     client.onOpen()
 
-proc fireError(client: AsyncSseClient; msg: string) =
+proc fireError(client: SyncSseClient; msg: string) =
   ## Fire the error callback unconditionally (spec §6.4 fires error after
   ## setting CLOSED). No readyState guard here — close() never calls this
   ## proc, and all internal callers are protected by isCancelled checks.
@@ -149,17 +168,24 @@ proc fireError(client: AsyncSseClient; msg: string) =
 # Internal: Socket Lifecycle
 # ---------------------------------------------------------------------------
 
-proc closeSocket(client: AsyncSseClient) =
+proc closeSocket(client: SyncSseClient) =
   if client.socket != nil:
     client.socket.close()
     client.socket = nil
 
-proc openSocket(client: AsyncSseClient; target: SseUrl): Future[bool] {.async.} =
+proc openSocket(client: SyncSseClient; target: SseUrl): bool =
   ## Open a TCP connection to the target host:port.
-  ## Returns true on success, false on network error.
+  ## Returns true on success, false on network error or connect timeout.
+  ##
+  ## Note: a blocking connect is not cancellable mid-attempt; the
+  ## `connectTimeout` bounds how long it can hold up the loop.
   try:
-    client.socket = newAsyncSocket()
-    await client.socket.connect(target.host, Port(target.port))
+    client.socket = newSocket()
+    if client.config.connectTimeout > 0:
+      client.socket.connect(target.host, Port(target.port),
+                            client.config.connectTimeout)
+    else:
+      client.socket.connect(target.host, Port(target.port))
     # TLS wrapping deferred to Phase 8:
     # if target.useTls:
     #   let ctx = newContext(...)
@@ -170,23 +196,74 @@ proc openSocket(client: AsyncSseClient; target: SseUrl): Future[bool] {.async.} 
     return false
 
 # ---------------------------------------------------------------------------
+# Internal: Polling Receive
+# ---------------------------------------------------------------------------
+
+proc pollRecv(client: SyncSseClient; stallTimeout: int;
+              data: var string): RecvOutcome =
+  ## Blocking recv that wakes every `pollInterval` to check cancellation.
+  ##
+  ## `stallTimeout` > 0 bounds the total time spent waiting for bytes;
+  ## exceeding it returns `roStalled`. 0 waits indefinitely (until data,
+  ## close, or cancellation).
+  ##
+  ## Waits for a single byte with the poll timeout, then drains the
+  ## socket's internal buffer non-blockingly. A larger recv-with-timeout
+  ## cannot be used here: std/net's timeout recv loops trying to fill the
+  ## full requested size and raises TimeoutError on a partial read,
+  ## silently discarding the bytes already consumed — which would lose
+  ## data whenever the server pauses mid-stream.
+  let interval = max(client.config.pollInterval, 1)
+  var idleMs = 0
+  while true:
+    if client.isCancelled:
+      return roCancelled
+    var first: string
+    try:
+      first = client.socket.recv(1, timeout = interval)
+    except TimeoutError:
+      idleMs += interval
+      if stallTimeout > 0 and idleMs >= stallTimeout:
+        return roStalled
+      continue
+    except CatchableError:
+      return roClosed
+    if first.len == 0:
+      return roClosed
+    data = first
+    # Drain already-buffered bytes without blocking. `hasDataBuffered`
+    # guarantees the low-level pointer recv is served straight from the
+    # socket's internal buffer (a memcpy — no syscall, no per-byte string
+    # allocation). Anything beyond the buffer is picked up instantly on
+    # the next pollRecv call. The pointer recv reports errors via its
+    # return value; on anything but 1, deliver what we have and let the
+    # next call surface the failure.
+    var c: char
+    while data.len < client.config.recvSize and
+          client.socket.hasDataBuffered:
+      if client.socket.recv(addr c, 1) != 1:
+        break
+      data.add(c)
+    return roData
+
+# ---------------------------------------------------------------------------
 # Internal: Body Feeding
 # ---------------------------------------------------------------------------
 
-proc feedBody(client: AsyncSseClient; raw: string) =
+proc feedBody(client: SyncSseClient; raw: string) =
   ## Decode (strip transfer framing) and feed bytes to the parser.
   let decoded = client.body.decode(raw)
   if decoded.len > 0:
     client.parser.feed(decoded)
 
-proc isBodyFinished(client: AsyncSseClient): bool =
+proc isBodyFinished(client: SyncSseClient): bool =
   client.body.isFinished
 
 # ---------------------------------------------------------------------------
 # Internal: Single Connection Attempt
 # ---------------------------------------------------------------------------
 
-proc attemptConnect(client: AsyncSseClient): Future[ConnectOutcome] {.async.} =
+proc attemptConnect(client: SyncSseClient): ConnectOutcome =
   ## Perform one connection attempt: open socket, send request, parse
   ## response headers, follow redirects, validate.
   ##
@@ -201,7 +278,7 @@ proc attemptConnect(client: AsyncSseClient): Future[ConnectOutcome] {.async.} =
       return coFatal
 
     # -- Open socket --
-    if not await client.openSocket(currentUrl):
+    if not client.openSocket(currentUrl):
       return coRetry
 
     if client.isCancelled:
@@ -212,7 +289,7 @@ proc attemptConnect(client: AsyncSseClient): Future[ConnectOutcome] {.async.} =
     let lastId = client.parser.lastEventId
     let request = buildRequest(currentUrl, lastId)
     try:
-      await client.socket.send(request)
+      client.socket.send(request)
     except CatchableError:
       client.closeSocket()
       return coRetry
@@ -222,22 +299,22 @@ proc attemptConnect(client: AsyncSseClient): Future[ConnectOutcome] {.async.} =
       return coFatal
 
     # -- Read response headers --
+    # No stall timeout here (parity with the async client, which applies
+    # stallTimeout only to the body); cancellation is still observed at
+    # every pollInterval.
     var hp = initHeaderParser()
     var bodyRemainder = ""
     while not hp.isComplete and not hp.hasFailed:
-      if client.isCancelled:
+      var data: string
+      case client.pollRecv(0, data)
+      of roData:
+        bodyRemainder = hp.feed(data)
+      of roCancelled:
         client.closeSocket()
         return coFatal
-      var data: string
-      try:
-        data = await client.socket.recv(client.config.recvSize)
-      except CatchableError:
+      of roClosed, roStalled:
         client.closeSocket()
         return coRetry
-      if data.len == 0:
-        client.closeSocket()
-        return coRetry
-      bodyRemainder = hp.feed(data)
 
     if hp.hasFailed:
       client.closeSocket()
@@ -295,15 +372,12 @@ proc attemptConnect(client: AsyncSseClient): Future[ConnectOutcome] {.async.} =
 # Internal: Body Read Loop
 # ---------------------------------------------------------------------------
 
-proc readBody(client: AsyncSseClient) {.async.} =
+proc readBody(client: SyncSseClient) =
   ## Read the response body, feeding chunks to the parser.
   ## Returns when: connection closes, body finishes, stall timeout
   ## fires, or client is cancelled. Calls `parser.complete()` on all
   ## non-cancel exit paths to flush any pending CR line ending and
-  ## discard incomplete events per spec §3.5. On stall timeout, the
-  ## socket is closed immediately and the orphaned recv future's error
-  ## is consumed to prevent unhandled-exception warnings from
-  ## asyncdispatch.
+  ## discard incomplete events per spec §3.5.
   while true:
     if client.isCancelled:
       return
@@ -312,34 +386,20 @@ proc readBody(client: AsyncSseClient) {.async.} =
       return
 
     var data: string
-    try:
-      if client.config.stallTimeout > 0:
-        let recvFut = client.socket.recv(client.config.recvSize)
-        let completed = await withTimeout(recvFut, client.config.stallTimeout)
-        if not completed:
-          recvFut.addCallback(proc(f: Future[string]) =
-            if f.failed: discard f.readError)
-          client.closeSocket()
-          client.parser.complete()
-          return
-        data = recvFut.read()
-      else:
-        data = await client.socket.recv(client.config.recvSize)
-    except CatchableError:
+    case client.pollRecv(client.config.stallTimeout, data)
+    of roData:
+      client.feedBody(data)
+    of roCancelled:
+      return
+    of roClosed, roStalled:
       client.parser.complete()
       return
-
-    if data.len == 0:
-      client.parser.complete()
-      return
-
-    client.feedBody(data)
 
 # ---------------------------------------------------------------------------
 # Internal: Backoff Delay
 # ---------------------------------------------------------------------------
 
-proc reconnectDelay(client: AsyncSseClient): int =
+proc reconnectDelay(client: SyncSseClient): int =
   ## Compute reconnection delay via the shared backoff formula (see
   ## `client_shared.backoffDelay`). Backoff only applies after consecutive
   ## failed connection attempts (coRetry); a clean end-of-body reconnects
@@ -348,26 +408,28 @@ proc reconnectDelay(client: AsyncSseClient): int =
                client.consecutiveFailures,
                client.config.maxReconnectDelay)
 
-proc cancelAwareSleep(client: AsyncSseClient; ms: int) {.async.} =
+proc cancelAwareSleep(client: SyncSseClient; ms: int) =
   ## Sleep for `ms` milliseconds, but return early if cancelled.
-  ## Polls every 250ms.
+  ## Wakes every `pollInterval` to check the flag.
+  let interval = max(client.config.pollInterval, 1)
   var remaining = ms
   while remaining > 0:
     if client.isCancelled: return
-    let chunk = min(remaining, 250)
-    await sleepAsync(chunk)
+    let chunk = min(remaining, interval)
+    sleep(chunk)
     remaining -= chunk
 
 # ---------------------------------------------------------------------------
-# Public: Connect (Main Event Loop)
+# Public: Connect (Main Loop)
 # ---------------------------------------------------------------------------
 
-proc connect*(client: AsyncSseClient) {.async.} =
-  ## Begin the SSE connection lifecycle.
+proc connect*(client: SyncSseClient) =
+  ## Begin the SSE connection lifecycle. Blocking.
   ##
-  ## This future runs until `close()` is called or a fatal error occurs.
-  ## It internally handles reconnection with exponential backoff when
-  ## `autoReconnect` is true. Set all callbacks before calling this.
+  ## This call runs until `close()` is called (from a callback), the
+  ## cancel token fires (possibly from another thread), or a fatal error
+  ## occurs. It internally handles reconnection with exponential backoff
+  ## when `autoReconnect` is true. Set all callbacks before calling this.
   ##
   ## Returns immediately if the client is already closed or its cancel
   ## token has fired: Closed is terminal (spec §6), so `close()` before
@@ -377,7 +439,7 @@ proc connect*(client: AsyncSseClient) {.async.} =
   client.readyState = Connecting
 
   while not client.isCancelled:
-    let outcome = await client.attemptConnect()
+    let outcome = client.attemptConnect()
 
     case outcome
     of coFatal:
@@ -392,8 +454,7 @@ proc connect*(client: AsyncSseClient) {.async.} =
       client.readyState = Connecting
       client.fireError("connection error; reconnecting")
       inc client.consecutiveFailures
-      let delay = client.reconnectDelay()
-      await client.cancelAwareSleep(delay)
+      client.cancelAwareSleep(client.reconnectDelay())
       continue
     of coSuccess:
       if client.isCancelled:
@@ -415,7 +476,7 @@ proc connect*(client: AsyncSseClient) {.async.} =
       break
 
     # -- Body read loop --
-    await client.readBody()
+    client.readBody()
 
     # -- Connection ended --
     client.closeSocket()
@@ -433,8 +494,7 @@ proc connect*(client: AsyncSseClient) {.async.} =
     # path when the connection attempt itself fails.
     client.readyState = Connecting
     client.fireError("connection lost; reconnecting")
-    let delay = client.reconnectDelay()
-    await client.cancelAwareSleep(delay)
+    client.cancelAwareSleep(client.reconnectDelay())
 
   # Final cleanup
   client.closeSocket()
@@ -445,25 +505,27 @@ proc connect*(client: AsyncSseClient) {.async.} =
 # Public: Close
 # ---------------------------------------------------------------------------
 
-proc close*(client: AsyncSseClient) =
-  ## Close the connection immediately (spec §6.5).
+proc close*(client: SyncSseClient) =
+  ## Close the connection (spec §6.5). No error event is fired.
   ##
-  ## Sets readyState to Closed and aborts any in-flight socket operation.
-  ## No error event is fired. The `connect` future will complete shortly
-  ## after this call.
+  ## Sets readyState to Closed; the blocking `connect` loop observes it
+  ## within one `pollInterval` and tears down the socket on its own
+  ## thread. Call this from the client's thread only — typically from
+  ## inside a callback while `connect` is running, or before/after
+  ## `connect`. For cross-thread cancellation, use a `CancelToken`
+  ## instead (its flag is atomic; readyState is not).
   if client.readyState == Closed:
     return
   client.readyState = Closed
-  client.closeSocket()
 
 # ---------------------------------------------------------------------------
 # Public: Accessors
 # ---------------------------------------------------------------------------
 
-proc lastEventId*(client: AsyncSseClient): string =
+proc lastEventId*(client: SyncSseClient): string =
   ## The current last event ID (sent as Last-Event-ID on reconnection).
   client.parser.lastEventId
 
-proc reconnectionTime*(client: AsyncSseClient): int =
+proc reconnectionTime*(client: SyncSseClient): int =
   ## Current reconnection time in ms (may have been updated by server).
   client.parser.reconnectionTime
