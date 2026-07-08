@@ -1,3 +1,7 @@
+## Core public types shared by every module in the library: events,
+## connection states, cancellation, and the callback signatures used
+## for event delivery. Pure data definitions — no logic, no I/O.
+
 import std/atomics
 
 type

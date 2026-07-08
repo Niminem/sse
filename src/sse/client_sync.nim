@@ -17,6 +17,8 @@
 
 import std/[net, os]
 import types, parser, http, client_shared
+when defined(ssl):
+  import tls
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -37,6 +39,19 @@ type
     pollInterval*: int        ## Per-recv timeout in ms; bounds how quickly
                               ## cancellation is observed while blocked.
     connectTimeout*: int      ## TCP connect timeout in ms (0 = OS default).
+                              ## Covers the TCP connect only; the blocking
+                              ## TLS handshake that follows has no timeout
+                              ## and is not cancellable mid-attempt
+                              ## (std/net exposes none).
+    when defined(ssl):
+      verifyHostname*: bool = true
+                              ## Check that the server certificate matches
+                              ## the request hostname (independent of the
+                              ## chain verification configured on the
+                              ## context). Disable together with a
+                              ## CVerifyNone context (see the client's
+                              ## `sslContext` field) to accept self-signed
+                              ## certificates, e.g. in development.
 
 const
   DefaultSyncConfig* = SyncSseClientConfig(
@@ -84,6 +99,18 @@ type
     onOpen*: SseNotifyHandler
     onError*: SseErrorHandler
 
+    # -- TLS --
+    when defined(ssl):
+      sslContext*: SslContext ## Custom TLS context for https connections
+                              ## (custom CA bundle, client certificates,
+                              ## CVerifyNone, ...); set before `connect`.
+                              ## nil uses a per-client default: CVerifyPeer
+                              ## + system CA roots. A supplied context is
+                              ## owned by the caller and never destroyed
+                              ## by the client. Lives on the client rather
+                              ## than the config because ref fields would
+                              ## make the config object unusable in consts.
+
     # -- Private --
     parser: SseParser
     socket: Socket
@@ -94,6 +121,11 @@ type
                               ## headers; delivered only after the open
                               ## event fires (spec §6.2 orders the open
                               ## announcement before stream interpretation).
+    when defined(ssl):
+      defaultTlsCtx: SslContext ## Lazily-created default context, cached
+                                ## so the CA store is scanned once per
+                                ## client, not per reconnect attempt.
+                                ## Lives as long as the client.
 
 # ---------------------------------------------------------------------------
 # Constructor
@@ -105,9 +137,15 @@ proc newSyncSseClient*(rawUrl: string;
   ## Create a new sync SSE client.
   ##
   ## Validates the URL synchronously (spec §6.1 steps 1–3). Raises
-  ## `ValueError` if the URL is invalid or uses an unsupported scheme.
-  ## No network activity occurs until `connect` is called.
+  ## `ValueError` if the URL is invalid or uses an unsupported scheme,
+  ## or if the URL is `https` and the library was built without TLS
+  ## support (`-d:ssl`). No network activity occurs until `connect`
+  ## is called.
   let parsedUrl = parseSseUrl(rawUrl)
+  when not defined(ssl):
+    if parsedUrl.useTls:
+      raise newException(ValueError,
+        "https URLs require building with -d:ssl: " & rawUrl)
   result = SyncSseClient(
     readyState: Connecting,
     url: parsedUrl,
@@ -173,12 +211,20 @@ proc closeSocket(client: SyncSseClient) =
     client.socket.close()
     client.socket = nil
 
-proc openSocket(client: SyncSseClient; target: SseUrl): bool =
-  ## Open a TCP connection to the target host:port.
-  ## Returns true on success, false on network error or connect timeout.
+proc openSocket(client: SyncSseClient; target: SseUrl): ConnectOutcome =
+  ## Open a TCP — and for https targets, TLS — connection to host:port.
+  ##
+  ## coSuccess: socket connected; for TLS, handshake completed and the
+  ## certificate hostname verified. coRetry: transient network failure
+  ## or connect timeout. coFatal: TLS configuration or verification
+  ## failure — deterministic, so retrying cannot succeed; readyState is
+  ## set to Closed and the error event fired here (as in attemptConnect's
+  ## other fatal paths).
   ##
   ## Note: a blocking connect is not cancellable mid-attempt; the
-  ## `connectTimeout` bounds how long it can hold up the loop.
+  ## `connectTimeout` bounds how long the TCP connect can hold up the
+  ## loop. The TLS handshake that follows has no timeout (std/net
+  ## exposes none) and can block until the OS gives up on the peer.
   try:
     client.socket = newSocket()
     if client.config.connectTimeout > 0:
@@ -186,14 +232,42 @@ proc openSocket(client: SyncSseClient; target: SseUrl): bool =
                             client.config.connectTimeout)
     else:
       client.socket.connect(target.host, Port(target.port))
-    # TLS wrapping deferred to Phase 8:
-    # if target.useTls:
-    #   let ctx = newContext(...)
-    #   wrapConnectedSocket(ctx, client.socket, handshakeAsClient, target.host)
-    return true
   except CatchableError:
     client.closeSocket()
-    return false
+    return coRetry
+
+  when defined(ssl):
+    if target.useTls:
+      var ctx: SslContext
+      try:
+        ctx = resolveTlsContext(client.sslContext,
+                                client.defaultTlsCtx)
+      except CatchableError as e:
+        # Context creation (missing CA bundle, OpenSSL not loadable).
+        # Deterministic; a retry loop never heals it.
+        client.closeSocket()
+        client.readyState = Closed
+        client.fireError("TLS setup failed: " & e.msg)
+        return coFatal
+      try:
+        tlsHandshake(client.socket, ctx, target.host)
+        if client.config.verifyHostname:
+          # std/net's own hostname check is compiled out on Windows;
+          # ours runs unconditionally on every platform. See sse/tls.
+          verifyPeerHostname(client.socket.sslHandle, target.host)
+      except SslError as e:
+        # Untrusted chain, protocol mismatch, or certificate/hostname
+        # mismatch: deterministic and fatal.
+        client.closeSocket()
+        client.readyState = Closed
+        client.fireError("TLS handshake failed: " & e.msg)
+        return coFatal
+      except CatchableError:
+        # Transport-level failure mid-handshake (reset, close).
+        client.closeSocket()
+        return coRetry
+
+  coSuccess
 
 # ---------------------------------------------------------------------------
 # Internal: Polling Receive
@@ -277,9 +351,11 @@ proc attemptConnect(client: SyncSseClient): ConnectOutcome =
     if client.isCancelled:
       return coFatal
 
-    # -- Open socket --
-    if not client.openSocket(currentUrl):
-      return coRetry
+    # -- Open socket (TCP + TLS handshake for https) --
+    case client.openSocket(currentUrl)
+    of coRetry: return coRetry
+    of coFatal: return coFatal
+    of coSuccess: discard
 
     if client.isCancelled:
       client.closeSocket()

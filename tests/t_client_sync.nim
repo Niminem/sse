@@ -1,17 +1,3 @@
-## Port of tests/t_client_async.nim for the sync (blocking) client.
-##
-## Same suites and coverage, minus async plumbing: `connect` is a plain
-## blocking call, so no `waitFor`/`await`. Test bodies are wrapped in a
-## local `proc run()` (as in the async suite) so callback closures capture
-## locals, not module-level globals. Two tests are restructured for the
-## blocking model:
-## - "close during reconnection sleep" closes from the onError callback
-##   (the only same-thread vantage point while `connect` blocks).
-## - "cancel token shared across clients" runs each client on its own
-##   thread and cancels the shared token from the main thread, following
-##   the documented CancelToken lifetime rule (create before spawn, keep
-##   alive until join).
-
 import std/[unittest, net, os, strutils, times]
 import sse/[types, http, client_sync]
 

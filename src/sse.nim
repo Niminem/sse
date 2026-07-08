@@ -9,6 +9,8 @@ import sse/server
 import sse/http
 import sse/client_async
 import sse/client_sync
+when defined(ssl):
+  import sse/tls
 
 export types
 export parser
@@ -17,3 +19,5 @@ export server
 export http
 export client_async
 export client_sync
+when defined(ssl):
+  export tls

@@ -10,6 +10,8 @@
 
 import std/[asyncdispatch, asyncnet]
 import types, parser, http, client_shared
+when defined(ssl):
+  import tls
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -27,6 +29,15 @@ type
                               ## header-read phase has no deadline (but
                               ## remains cancellable).
     recvSize*: int            ## Socket recv buffer size hint in bytes.
+    when defined(ssl):
+      verifyHostname*: bool = true
+                              ## Check that the server certificate matches
+                              ## the request hostname (independent of the
+                              ## chain verification configured on the
+                              ## context). Disable together with a
+                              ## CVerifyNone context (see the client's
+                              ## `sslContext` field) to accept self-signed
+                              ## certificates, e.g. in development.
 
 const
   DefaultConfig* = AsyncSseClientConfig(
@@ -65,6 +76,18 @@ type
     onOpen*: SseNotifyHandler
     onError*: SseErrorHandler
 
+    # -- TLS --
+    when defined(ssl):
+      sslContext*: SslContext ## Custom TLS context for https connections
+                              ## (custom CA bundle, client certificates,
+                              ## CVerifyNone, ...); set before `connect`.
+                              ## nil uses a per-client default: CVerifyPeer
+                              ## + system CA roots. A supplied context is
+                              ## owned by the caller and never destroyed
+                              ## by the client. Lives on the client rather
+                              ## than the config because ref fields would
+                              ## make the config object unusable in consts.
+
     # -- Private --
     parser: SseParser
     socket: AsyncSocket
@@ -75,6 +98,11 @@ type
                               ## headers; delivered only after the open
                               ## event fires (spec §6.2 orders the open
                               ## announcement before stream interpretation).
+    when defined(ssl):
+      defaultTlsCtx: SslContext ## Lazily-created default context, cached
+                                ## so the CA store is scanned once per
+                                ## client, not per reconnect attempt.
+                                ## Lives as long as the client.
 
 # ---------------------------------------------------------------------------
 # Constructor
@@ -86,9 +114,15 @@ proc newAsyncSseClient*(rawUrl: string;
   ## Create a new async SSE client.
   ##
   ## Validates the URL synchronously (spec §6.1 steps 1–3). Raises
-  ## `ValueError` if the URL is invalid or uses an unsupported scheme.
-  ## No network activity occurs until `connect` is called.
+  ## `ValueError` if the URL is invalid or uses an unsupported scheme,
+  ## or if the URL is `https` and the library was built without TLS
+  ## support (`-d:ssl`). No network activity occurs until `connect`
+  ## is called.
   let parsedUrl = parseSseUrl(rawUrl)
+  when not defined(ssl):
+    if parsedUrl.useTls:
+      raise newException(ValueError,
+        "https URLs require building with -d:ssl: " & rawUrl)
   result = AsyncSseClient(
     readyState: Connecting,
     url: parsedUrl,
@@ -154,20 +188,79 @@ proc closeSocket(client: AsyncSseClient) =
     client.socket.close()
     client.socket = nil
 
-proc openSocket(client: AsyncSseClient; target: SseUrl): Future[bool] {.async.} =
-  ## Open a TCP connection to the target host:port.
-  ## Returns true on success, false on network error.
+proc openSocket(client: AsyncSseClient;
+                target: SseUrl): Future[ConnectOutcome] {.async.} =
+  ## Open a TCP — and for https targets, TLS — connection to host:port.
+  ##
+  ## coSuccess: socket connected; for TLS, handshake completed and the
+  ## certificate hostname verified. coRetry: transient network failure.
+  ## coFatal: TLS configuration or verification failure — deterministic,
+  ## so retrying cannot succeed; readyState is set to Closed and the
+  ## error event fired here (as in attemptConnect's other fatal paths).
+  when not defined(ssl):
+    if target.useTls:
+      # Only reachable via a cross-scheme redirect: the constructor
+      # rejects https URLs outright in non-SSL builds.
+      client.readyState = Closed
+      client.fireError("https redirect target requires building with -d:ssl")
+      return coFatal
+
   try:
-    client.socket = newAsyncSocket()
-    await client.socket.connect(target.host, Port(target.port))
-    # TLS wrapping deferred to Phase 8:
-    # if target.useTls:
-    #   let ctx = newContext(...)
-    #   wrapConnectedSocket(ctx, client.socket, handshakeAsClient, target.host)
-    return true
+    # Unbuffered is load-bearing: asyncnet's buffered recv(N) loops until
+    # it accumulates all N bytes or the peer closes, which stalls event
+    # delivery indefinitely on a live SSE stream that trickles data and
+    # never closes. Unbuffered recv returns whatever the OS (or the TLS
+    # record layer) has available, matching the spec's line-buffering
+    # guidance (§3.2) for timely dispatch.
+    client.socket = newAsyncSocket(buffered = false)
   except CatchableError:
+    return coRetry
+
+  when defined(ssl):
+    if target.useTls:
+      try:
+        # Wrap before connect: asyncnet's connect then drives the
+        # non-blocking handshake itself (setting SNI for non-IP hosts),
+        # so handshake errors surface in the connect call below.
+        wrapSocket(resolveTlsContext(client.sslContext,
+                                     client.defaultTlsCtx),
+                   client.socket)
+      except CatchableError as e:
+        # Context creation (missing CA bundle, OpenSSL not loadable) or
+        # SSL_new failure. Deterministic; a retry loop never heals it.
+        client.closeSocket()
+        client.readyState = Closed
+        client.fireError("TLS setup failed: " & e.msg)
+        return coFatal
+
+  try:
+    await client.socket.connect(target.host, Port(target.port))
+  except CatchableError as e:
     client.closeSocket()
-    return false
+    when defined(ssl):
+      # TCP-level failures (OSError) are transient and retried; SslError
+      # from the handshake (untrusted chain, protocol mismatch, bad
+      # certificate) is deterministic and fatal.
+      if e of SslError:
+        client.readyState = Closed
+        client.fireError("TLS handshake failed: " & e.msg)
+        return coFatal
+    return coRetry
+
+  when defined(ssl):
+    if target.useTls and client.config.verifyHostname:
+      # std/asyncnet performs no certificate hostname check on any
+      # platform; without this a valid certificate for any domain would
+      # be accepted for every host. See sse/tls.
+      try:
+        verifyPeerHostname(client.socket.sslHandle, target.host)
+      except SslError as e:
+        client.closeSocket()
+        client.readyState = Closed
+        client.fireError("TLS certificate verification failed: " & e.msg)
+        return coFatal
+
+  return coSuccess
 
 # ---------------------------------------------------------------------------
 # Internal: Body Feeding
@@ -200,9 +293,11 @@ proc attemptConnect(client: AsyncSseClient): Future[ConnectOutcome] {.async.} =
     if client.isCancelled:
       return coFatal
 
-    # -- Open socket --
-    if not await client.openSocket(currentUrl):
-      return coRetry
+    # -- Open socket (TCP + TLS handshake for https) --
+    case await client.openSocket(currentUrl)
+    of coRetry: return coRetry
+    of coFatal: return coFatal
+    of coSuccess: discard
 
     if client.isCancelled:
       client.closeSocket()

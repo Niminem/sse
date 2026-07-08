@@ -3,3 +3,4 @@ nimble.paths
 nimbledeps
 .DS_Store
 *.exe
+/archive
