@@ -4,11 +4,12 @@
 ## with automatic exponential backoff, redirect following, and optional
 ## stall detection. Delivers events via callbacks set on the client object.
 ##
-## Uses std/asyncdispatch + std/asyncnet for non-blocking I/O. The parser
-## and HTTP layers are pure (no I/O) and imported from sibling modules.
+## Uses std/asyncdispatch + std/asyncnet for non-blocking I/O. The parser,
+## HTTP, and shared client-logic layers are pure (no I/O) and imported
+## from sibling modules (`parser`, `http`, `client_shared`).
 
 import std/[asyncdispatch, asyncnet]
-import types, parser, http
+import types, parser, http, client_shared
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -66,9 +67,7 @@ type
     socket: AsyncSocket
     cancelToken: CancelToken
     consecutiveFailures: int
-    transferMode: TransferMode
-    chunkedDecoder: ChunkedDecoder
-    contentRemaining: int
+    body: BodyDecoder
 
 # ---------------------------------------------------------------------------
 # Constructor
@@ -165,28 +164,13 @@ proc openSocket(client: AsyncSseClient; target: SseUrl): Future[bool] {.async.} 
 # ---------------------------------------------------------------------------
 
 proc feedBody(client: AsyncSseClient; raw: string) =
-  ## Decode (if chunked) and feed bytes to the parser.
-  case client.transferMode
-  of tmChunked:
-    let decoded = client.chunkedDecoder.feed(raw)
-    if decoded.len > 0:
-      client.parser.feed(decoded)
-  of tmContentLength:
-    let take = min(raw.len, client.contentRemaining)
-    if take > 0:
-      client.parser.feed(raw[0 ..< take])
-      client.contentRemaining -= take
-  of tmIdentity:
-    client.parser.feed(raw)
+  ## Decode (strip transfer framing) and feed bytes to the parser.
+  let decoded = client.body.decode(raw)
+  if decoded.len > 0:
+    client.parser.feed(decoded)
 
 proc isBodyFinished(client: AsyncSseClient): bool =
-  case client.transferMode
-  of tmChunked:
-    client.chunkedDecoder.isFinished or client.chunkedDecoder.hasFailed
-  of tmContentLength:
-    client.contentRemaining <= 0
-  of tmIdentity:
-    false
+  client.body.isFinished
 
 # ---------------------------------------------------------------------------
 # Internal: Single Connection Attempt
@@ -262,10 +246,7 @@ proc attemptConnect(client: AsyncSseClient): Future[ConnectOutcome] {.async.} =
       # only be updated by permanent redirects (lines above).
       client.wireParser(currentUrl)
       client.parser.reset()
-      client.transferMode = detectTransferMode(resp)
-      if client.transferMode == tmChunked:
-        client.chunkedDecoder = initChunkedDecoder()
-      client.contentRemaining = contentLength(resp)
+      client.body = initBodyDecoder(resp)
       if bodyRemainder.len > 0:
         client.feedBody(bodyRemainder)
       return coSuccess
@@ -347,23 +328,13 @@ proc readBody(client: AsyncSseClient) {.async.} =
 # ---------------------------------------------------------------------------
 
 proc reconnectDelay(client: AsyncSseClient): int =
-  ## Compute reconnection delay with exponential backoff.
-  ## When consecutiveFailures is 0 (e.g. after a clean end-of-body), returns
-  ## the plain reconnectionTime per spec §6.3 step 2. Backoff only applies
-  ## after consecutive failed connection attempts (coRetry).
-  ## Formula: min(reconnectionTime * 2^failures, maxReconnectDelay)
-  let cap = client.config.maxReconnectDelay
-  let base = client.parser.reconnectionTime
-  if base <= 0:
-    return base
-  let shift = min(client.consecutiveFailures, 30)
-  let multiplier = 1 shl shift
-  if base > cap div multiplier:
-    return cap
-  let delay = base * multiplier
-  if delay > cap:
-    return cap
-  return delay
+  ## Compute reconnection delay via the shared backoff formula (see
+  ## `client_shared.backoffDelay`). Backoff only applies after consecutive
+  ## failed connection attempts (coRetry); a clean end-of-body reconnects
+  ## with the plain reconnectionTime.
+  backoffDelay(client.parser.reconnectionTime,
+               client.consecutiveFailures,
+               client.config.maxReconnectDelay)
 
 proc cancelAwareSleep(client: AsyncSseClient; ms: int) {.async.} =
   ## Sleep for `ms` milliseconds, but return early if cancelled.

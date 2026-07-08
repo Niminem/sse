@@ -1,3 +1,5 @@
+import std/atomics
+
 type
   ReadyState* = enum
     Connecting = 0
@@ -13,7 +15,15 @@ type
   CancelToken* = ref object
     ## Cooperative cancellation signal. Shared across one or more clients
     ## to cancel them all with a single call to `cancel()`.
-    cancelled*: bool
+    ##
+    ## The flag itself is atomic, so `cancel()` may be called from another
+    ## thread (e.g. to cancel a sync client blocked in its read loop).
+    ## Lifetime rule for cross-thread use: create the token *before*
+    ## spawning the thread, keep a reference alive on the creating thread
+    ## until all clients using it are done, and do not copy references
+    ## between threads mid-flight (reference *counting* is not atomic
+    ## under ORC).
+    flag: Atomic[bool]
 
   SseEventHandler* = proc (event: SseEvent) {.closure, gcsafe.}
   SseCommentHandler* = proc (comment: string) {.closure, gcsafe.}
@@ -22,9 +32,14 @@ type
 
 proc newCancelToken*(): CancelToken =
   ## Create a new cancel token in the non-cancelled state.
-  CancelToken(cancelled: false)
+  CancelToken()
 
 proc cancel*(token: CancelToken) =
   ## Signal cancellation. All clients sharing this token will observe
-  ## cancellation at their next yield point.
-  token.cancelled = true
+  ## cancellation at their next yield point (async) or poll (sync).
+  ## Safe to call from another thread.
+  token.flag.store(true)
+
+proc cancelled*(token: CancelToken): bool =
+  ## True once `cancel()` has been called. Safe to read from any thread.
+  token.flag.load()
