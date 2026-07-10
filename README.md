@@ -9,19 +9,15 @@ A spec-compliant [Server-Sent Events](https://html.spec.whatwg.org/multipage/ser
 
 ## Installation
 
-Until the package is on Nimble (see [progress](https://github.com/nim-lang/packages/pull/3408)):
-
-```
-git clone https://github.com/Niminem/sse
-```
-
-Otherwise:
-
 ```
 nimble install sse
 ```
 
-Requires Nim ≥ 2.2.10. For `https://` URLs, build your program with `-d:ssl`.
+or
+
+```
+git clone https://github.com/Niminem/sse
+```
 
 ## Client quickstart
 
