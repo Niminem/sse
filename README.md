@@ -9,7 +9,7 @@ A spec-compliant [Server-Sent Events](https://html.spec.whatwg.org/multipage/ser
 
 ## Installation
 
-Until the package is on Nimble:
+Until the package is on Nimble (see [progress](https://github.com/nim-lang/packages/pull/3408)):
 
 ```
 git clone https://github.com/Niminem/sse
