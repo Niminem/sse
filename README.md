@@ -9,8 +9,16 @@ A spec-compliant [Server-Sent Events](https://html.spec.whatwg.org/multipage/ser
 
 ## Installation
 
-```bash
-nimble install https://github.com/Niminem/sse
+Until the package is on Nimble:
+
+```
+git clone https://github.com/Niminem/sse
+```
+
+Otherwise:
+
+```
+nimble install sse
 ```
 
 Requires Nim ≥ 2.2.10. For `https://` URLs, build your program with `-d:ssl`.
