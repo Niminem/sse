@@ -283,6 +283,105 @@ suite "buildRequest":
     check '\n' notin withoutCrlf
 
 # ---------------------------------------------------------------------------
+# 5b. Request Building — Custom Method / Headers / Body
+# ---------------------------------------------------------------------------
+
+suite "buildRequest — Custom Requests":
+
+  test "POST request line":
+    let url = parseSseUrl("http://example.com/v1/messages")
+    let req = buildRequest(url, httpMethod = HttpPost)
+    check req.startsWith("POST /v1/messages HTTP/1.1\r\n")
+
+  test "extra headers emitted verbatim after built-ins":
+    let url = parseSseUrl("http://example.com/events")
+    let req = buildRequest(url,
+      extraHeaders = @[("x-api-key", "secret"),
+                       ("anthropic-version", "2023-06-01")])
+    check "x-api-key: secret\r\n" in req
+    check "anthropic-version: 2023-06-01\r\n" in req
+    check req.find("Cache-Control:") < req.find("x-api-key:")
+
+  test "duplicate extra header names both emitted":
+    let url = parseSseUrl("http://example.com/events")
+    let req = buildRequest(url,
+      extraHeaders = @[("X-Multi", "one"), ("X-Multi", "two")])
+    check "X-Multi: one\r\n" in req
+    check "X-Multi: two\r\n" in req
+
+  test "body appended after blank line with Content-Length":
+    let url = parseSseUrl("http://example.com/v1/messages")
+    let body = """{"stream":true}"""
+    let req = buildRequest(url, httpMethod = HttpPost, body = body)
+    check "Content-Length: " & $body.len & "\r\n" in req
+    check req.endsWith("\r\n\r\n" & body)
+
+  test "empty body adds no Content-Length":
+    let url = parseSseUrl("http://example.com/events")
+    let req = buildRequest(url, httpMethod = HttpPost)
+    check "Content-Length" notin req
+    check req.endsWith("\r\n\r\n")
+
+  test "Last-Event-ID still emitted alongside custom options":
+    let url = parseSseUrl("http://example.com/events")
+    let req = buildRequest(url, lastEventId = "42", httpMethod = HttpPost,
+                           extraHeaders = @[("X-A", "b")], body = "payload")
+    check "Last-Event-ID: 42\r\n" in req
+    check "X-A: b\r\n" in req
+    check req.endsWith("payload")
+
+  test "defaults produce byte-identical spec-compliant GET request":
+    let url = parseSseUrl("http://example.com/events?t=1")
+    check buildRequest(url, lastEventId = "7") ==
+      buildRequest(url, "7", HttpGet, @[], "")
+
+suite "validateRequest":
+
+  test "defaults pass":
+    validateRequest(HttpGet, @[], "")
+
+  test "POST with body and headers passes":
+    validateRequest(HttpPost,
+      @[("content-type", "application/json"), ("x-api-key", "k")],
+      """{"stream":true}""")
+
+  test "empty header name rejected":
+    expect(ValueError):
+      validateRequest(HttpGet, @[("", "value")], "")
+
+  test "CR/LF in header name rejected":
+    expect(ValueError):
+      validateRequest(HttpGet, @[("X-Bad\r\nInjected", "v")], "")
+
+  test "CR/LF in header value rejected":
+    expect(ValueError):
+      validateRequest(HttpGet, @[("X-Bad", "v\r\nInjected: yes")], "")
+    expect(ValueError):
+      validateRequest(HttpGet, @[("X-Bad", "v\ninjected")], "")
+
+  test "reserved headers rejected case-insensitively":
+    for name in ["Host", "host", "Accept", "ACCEPT", "Cache-Control",
+                 "Last-Event-ID", "last-event-id", "Content-Length"]:
+      expect(ValueError):
+        validateRequest(HttpGet, @[(name, "v")], "")
+
+  test "non-reserved headers accepted":
+    validateRequest(HttpGet, @[("Content-Type", "application/json"),
+                               ("Authorization", "Bearer t")], "")
+
+  test "body with GET rejected":
+    expect(ValueError):
+      validateRequest(HttpGet, @[], "payload")
+
+  test "body with HEAD rejected":
+    expect(ValueError):
+      validateRequest(HttpHead, @[], "payload")
+
+  test "body with POST/PUT/PATCH/DELETE accepted":
+    for m in [HttpPost, HttpPut, HttpPatch, HttpDelete]:
+      validateRequest(m, @[], "payload")
+
+# ---------------------------------------------------------------------------
 # 6. HeaderParser — Single Feed
 # ---------------------------------------------------------------------------
 

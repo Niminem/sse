@@ -29,6 +29,28 @@ type
                               ## header-read phase has no deadline (but
                               ## remains cancellable).
     recvSize*: int            ## Socket recv buffer size hint in bytes.
+    httpMethod*: HttpMethod = HttpGet
+                              ## Request method. The EventSource spec only
+                              ## uses GET; POST etc. support non-spec
+                              ## endpoints that stream SSE in response to
+                              ## a custom request (e.g. LLM APIs).
+    extraHeaders*: seq[tuple[key, val: string]]
+                              ## Additional request headers, sent verbatim
+                              ## on every connection attempt (including
+                              ## reconnects and redirect hops). Names that
+                              ## collide with the client's own headers
+                              ## (Host, Accept, Cache-Control,
+                              ## Last-Event-ID, Content-Length) are
+                              ## rejected at construction.
+    body*: string             ## Request body, re-sent on every connection
+                              ## attempt. Non-empty adds a Content-Length
+                              ## header; supply Content-Type via
+                              ## `extraHeaders`. Rejected at construction
+                              ## for GET/HEAD. For one-shot request/stream
+                              ## endpoints (LLM APIs), also set
+                              ## `autoReconnect: false` — reconnecting
+                              ## re-sends the body and re-triggers the
+                              ## work server-side.
     when defined(ssl):
       verifyHostname*: bool = true
                               ## Check that the server certificate matches
@@ -116,9 +138,11 @@ proc newAsyncSseClient*(rawUrl: string;
   ## Validates the URL synchronously (spec §6.1 steps 1–3). Raises
   ## `ValueError` if the URL is invalid or uses an unsupported scheme,
   ## or if the URL is `https` and the library was built without TLS
-  ## support (`-d:ssl`). No network activity occurs until `connect`
-  ## is called.
+  ## support (`-d:ssl`). Also validates the custom request options
+  ## (`httpMethod`/`extraHeaders`/`body`, see `validateRequest`).
+  ## No network activity occurs until `connect` is called.
   let parsedUrl = parseSseUrl(rawUrl)
+  validateRequest(config.httpMethod, config.extraHeaders, config.body)
   when not defined(ssl):
     if parsedUrl.useTls:
       raise newException(ValueError,
@@ -305,7 +329,10 @@ proc attemptConnect(client: AsyncSseClient): Future[ConnectOutcome] {.async.} =
 
     # -- Send request --
     let lastId = client.parser.lastEventId
-    let request = buildRequest(currentUrl, lastId)
+    let request = buildRequest(currentUrl, lastId,
+                               client.config.httpMethod,
+                               client.config.extraHeaders,
+                               client.config.body)
     try:
       await client.socket.send(request)
     except CatchableError:

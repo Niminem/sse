@@ -72,6 +72,47 @@ let client = newSyncSseClient("http://localhost:8080/events",
 
 The async config (`AsyncSseClientConfig`) has the same fields minus `pollInterval`/`connectTimeout`. Defaults are `DefaultConfig` (async) and `DefaultSyncConfig` (sync).
 
+### Custom requests: POST, headers, body
+
+The EventSource spec only knows GET with fixed headers, but many modern SSE endpoints — LLM APIs in particular — expect a POST with a JSON payload and auth headers, and stream SSE back. Both configs support this via three new fields — `httpMethod` (default `HttpGet`), `extraHeaders` (default empty), and `body` (default empty) — so an untouched config still sends a spec-compliant GET:
+
+```nim
+import std/[json, os]
+import sse
+
+var config = DefaultSyncConfig
+config.autoReconnect = false      # important — see below
+config.httpMethod = HttpPost      # std/httpcore's HttpMethod, re-exported
+config.extraHeaders = @{
+  "content-type": "application/json",
+  "x-api-key": getEnv("ANTHROPIC_API_KEY"),
+  "anthropic-version": "2023-06-01",
+}
+config.body = $ %*{
+  "model": "claude-opus-4-8",
+  "max_tokens": 1024,
+  "stream": true,
+  "messages": [{"role": "user", "content": "Hello!"}],
+}
+
+let client = newSyncSseClient("https://api.anthropic.com/v1/messages", config)
+client.onEvent = proc (event: SseEvent) =
+  echo event.eventType, ": ", event.data
+  if event.eventType == "message_stop":
+    client.close()
+client.onError = proc (msg: string) =
+  echo "error: ", msg
+
+client.connect()
+```
+
+Rules, enforced with `ValueError` at construction:
+
+- Extra header names must not collide (case-insensitively) with the headers the client manages itself: `Host`, `Accept`, `Cache-Control`, `Last-Event-ID`, and `Content-Length` (computed from `body`). No CR/LF anywhere in names or values.
+- A non-empty `body` requires a method that allows one (not GET/HEAD). Set `Content-Type` via `extraHeaders`.
+
+**Set `autoReconnect: false` for request/response-style streams.** Reconnection re-sends the entire request — method, headers, and body — so an LLM endpoint would re-run (and re-bill) the whole generation, and `Last-Event-ID` resumption is meaningless there. Auto-reconnect with custom requests is only sensible for endpoints where replaying the request is idempotent.
+
 ### Cancellation
 
 Both clients accept an optional `CancelToken`. A token can be shared across any number of clients — sync and async alike — and a single `cancel()` call, safe from any thread (the flag is atomic), stops all of them at their next poll (sync) or yield point (async). Cancellation behaves like `close()`: no error event fires, and events already parsed but not yet delivered are silently dropped.
@@ -151,6 +192,7 @@ The parser, dispatch rules, reconnection semantics, `Last-Event-ID` handling, an
 
 - **Callbacks instead of the DOM `EventTarget` API** — `onEvent` receives every event type; there is no per-type listener registration.
 - **No CORS / `withCredentials`** — meaningless outside a browser.
+- **Custom request options** (`httpMethod`/`extraHeaders`/`body`) — the spec is GET-only with fixed headers; these opt-in fields exist for non-spec endpoints that stream SSE in response to a custom request (see "Custom requests" above). The defaults produce a byte-identical spec-compliant request.
 - **TLS failures are fatal, not retried.** The spec would reconnect on any non-abort network error, but retrying a deterministic handshake or hostname failure would hammer a misconfigured (or MITM'd) endpoint forever.
 - **All common redirect codes handled** (301/302/303/307/308; the spec only names 301/307). Permanent redirects (301/308) update the URL used for reconnection; temporary ones don't.
 

@@ -7,7 +7,11 @@
 ##
 ## Uses `std/uri` for RFC 3986 URL parsing and reference resolution.
 
-import std/[uri, strutils]
+import std/[uri, strutils, httpcore]
+
+# Re-export so users get `HttpMethod` and its values (HttpGet, HttpPost, ...)
+# from `import sse` without a separate `import std/httpcore`.
+export httpcore
 
 # ---------------------------------------------------------------------------
 # Types & Constants
@@ -169,20 +173,72 @@ proc resolveRedirect*(baseUrl: SseUrl; location: string): SseUrl =
 # HTTP Request
 # ---------------------------------------------------------------------------
 
-func buildRequest*(url: SseUrl; lastEventId = ""): string =
-  ## Build an HTTP/1.1 GET request for an SSE endpoint.
+const ReservedRequestHeaders* = [
+  ## Header names `buildRequest` emits itself. User-supplied extra headers
+  ## must not collide with these: `Host`/`Accept`/`Cache-Control` are fixed
+  ## by the EventSource spec, `Last-Event-ID` is managed by the reconnection
+  ## logic, and `Content-Length` is computed from the request body.
+  "host", "accept", "cache-control", "last-event-id", "content-length",
+]
+
+func validateRequest*(httpMethod: HttpMethod;
+                      extraHeaders: seq[tuple[key, val: string]];
+                      body: string) =
+  ## Validate custom request options before any network activity.
+  ##
+  ## Raises `ValueError` when a header name is empty or reserved (see
+  ## `ReservedRequestHeaders`), when a header name or value contains a
+  ## CR/LF (which would allow request injection, since headers are spliced
+  ## verbatim into the wire request), or when a body is supplied with a
+  ## bodiless method (GET/HEAD).
+  for (key, val) in extraHeaders:
+    if key.len == 0:
+      raise newException(ValueError, "empty header name")
+    if '\r' in key or '\n' in key:
+      raise newException(ValueError,
+        "header name contains CR/LF: " & key)
+    if '\r' in val or '\n' in val:
+      raise newException(ValueError,
+        "value of header '" & key & "' contains CR/LF")
+    if key.toLowerAscii() in ReservedRequestHeaders:
+      raise newException(ValueError,
+        "header '" & key & "' is managed by the client and cannot be " &
+        "overridden")
+  if body.len > 0 and httpMethod in {HttpGet, HttpHead}:
+    raise newException(ValueError,
+      "request body not allowed with method " & $httpMethod)
+
+func buildRequest*(url: SseUrl; lastEventId = "";
+                   httpMethod = HttpGet;
+                   extraHeaders: seq[tuple[key, val: string]] = @[];
+                   body = ""): string =
+  ## Build an HTTP/1.1 request for an SSE endpoint.
   ##
   ## Always includes `Host`, `Accept: text/event-stream`, and
   ## `Cache-Control: no-store` headers. Adds `Last-Event-ID` only when
   ## `lastEventId` is non-empty (spec §7.4: sent only during reconnection,
   ## only if non-empty).
-  result = "GET " & url.path & " HTTP/1.1\r\n"
+  ##
+  ## `httpMethod`, `extraHeaders`, and `body` support non-spec endpoints
+  ## that stream SSE in response to a custom request (e.g. LLM APIs that
+  ## expect a POST with a JSON payload and auth headers). Extra headers
+  ## are emitted after the built-in ones; a non-empty body adds a
+  ## `Content-Length` header and appends the payload. Callers are expected
+  ## to have run `validateRequest` on these options first — this proc does
+  ## not re-validate.
+  result = $httpMethod & " " & url.path & " HTTP/1.1\r\n"
   result.add("Host: " & url.hostHeader & "\r\n")
   result.add("Accept: text/event-stream\r\n")
   result.add("Cache-Control: no-store\r\n")
   if lastEventId.len > 0:
     result.add("Last-Event-ID: " & lastEventId & "\r\n")
+  for (key, val) in extraHeaders:
+    result.add(key & ": " & val & "\r\n")
+  if body.len > 0:
+    result.add("Content-Length: " & $body.len & "\r\n")
   result.add("\r\n")
+  if body.len > 0:
+    result.add(body)
 
 # ---------------------------------------------------------------------------
 # HTTP Response Header Parsing

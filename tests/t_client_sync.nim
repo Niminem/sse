@@ -1,4 +1,4 @@
-import std/[unittest, net, os, strutils, times]
+import std/[unittest, net, os, strutils, times, atomics]
 import sse/[types, http, client_sync]
 
 # ===========================================================================
@@ -109,7 +109,7 @@ const NoReconnect = SyncSseClientConfig(
 const FastReconnect = SyncSseClientConfig(
   autoReconnect: true,
   maxRedirects: 10,
-  maxReconnectDelay: 500,
+  maxReconnectDelay: 100,
   stallTimeout: 0,
   recvSize: 4096,
   pollInterval: 50,
@@ -129,6 +129,20 @@ proc findFreePort(): int =
   result = int(sock.getLocalAddr()[1])
   sock.close()
 
+# Server-readiness signalling. Every server proc increments the counter
+# once its socket is listening; awaitListening blocks until the servers
+# just created are ready. Replaces fixed 100-200 ms startup sleeps
+# (~3.5 s of padding per run) and cannot race a slow thread start.
+# A probe-connect helper is not an option here: the servers accept exactly
+# one client, so a probe would be consumed as the client under test.
+var serversListening: Atomic[int]
+var serversExpected = 0  # main-thread bookkeeping; tests run sequentially
+
+proc awaitListening(n = 1) =
+  serversExpected += n
+  while serversListening.load() < serversExpected:
+    sleep(1)
+
 type ServerConfig = tuple[port: int, response: string]
 
 proc serveOnce(cfg: ServerConfig) {.thread.} =
@@ -136,6 +150,7 @@ proc serveOnce(cfg: ServerConfig) {.thread.} =
   server.setSockOpt(OptReuseAddr, true)
   server.bindAddr(Port(cfg.port), address = "127.0.0.1")
   server.listen()
+  discard serversListening.fetchAdd(1)
   try:
     var client: Socket
     server.accept(client)
@@ -153,7 +168,7 @@ template withServer(response: string; body: untyped) =
   let port {.inject.} = findFreePort()
   var thr: Thread[ServerConfig]
   createThread(thr, serveOnce, (port, response))
-  sleep(100)
+  awaitListening()
   proc run() =
     body
   run()
@@ -402,6 +417,7 @@ proc serveMulti(cfg: MultiServerConfig) {.thread.} =
   server.setSockOpt(OptReuseAddr, true)
   server.bindAddr(Port(cfg.port), address = "127.0.0.1")
   server.listen()
+  discard serversListening.fetchAdd(1)
   let responses = [cfg.resp1, cfg.resp2, cfg.resp3]
   try:
     for i in 0 ..< cfg.count:
@@ -426,7 +442,7 @@ template withMultiServer(responses: openArray[string]; body: untyped) =
   let port {.inject.} = findFreePort()
   var thr: Thread[MultiServerConfig]
   createThread(thr, serveMulti, multiCfg(port, responses))
-  sleep(100)
+  awaitListening()
   proc run() =
     body
   run()
@@ -485,7 +501,7 @@ suite "Connection Failure - Retryable":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("data: first\n\n"), sseResponse("data: second\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc runRetryTest() =
       var errors: seq[string] = @[]
@@ -526,6 +542,7 @@ proc serveCaptureMulti(cfg: CaptureServerConfig) {.thread.} =
   server.setSockOpt(OptReuseAddr, true)
   server.bindAddr(Port(cfg.port), address = "127.0.0.1")
   server.listen()
+  discard serversListening.fetchAdd(1)
   let responses = [cfg.resp1, cfg.resp2]
   try:
     for i in 0 ..< 2:
@@ -548,7 +565,7 @@ suite "Reconnection Behavior":
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("id: 42\ndata: first\n\n"),
        sseResponse("data: second\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc run() =
       var events: seq[SseEvent] = @[]
@@ -577,7 +594,7 @@ suite "Reconnection Behavior":
       resp2: sseResponse("data: second\n\n"),
       reqBuf: addr reqBuf)
     createThread(thr, serveCaptureMulti, cfg)
-    sleep(100)
+    awaitListening()
 
     proc run() =
       var openCount = 0
@@ -606,7 +623,7 @@ suite "Reconnection Behavior":
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("data: first\n\n"),
        sseResponse("data: second\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc run() =
       var errors: seq[string] = @[]
@@ -629,7 +646,7 @@ suite "Reconnection Behavior":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("data: a\n\n"), sseResponse("data: b\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc run() =
       var states: seq[ReadyState] = @[]
@@ -661,7 +678,7 @@ suite "Exponential Backoff":
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("retry: 100\ndata: first\n\n"),
        sseResponse("data: second\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc run() =
       var openCount = 0
@@ -697,7 +714,7 @@ suite "Exponential Backoff":
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("retry: 50000\ndata: first\n\n"),
        sseResponse("data: second\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc run() =
       var openCount = 0
@@ -734,7 +751,7 @@ suite "Exponential Backoff":
       [sseResponse("retry: 100\ndata: a\n\n"),
        sseResponse("data: b\n\n"),
        sseResponse("data: c\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc run() =
       var openCount = 0
@@ -785,7 +802,7 @@ suite "Redirects":
                  sseResponse("data: redirected\n\n")]
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
-    sleep(100)
+    awaitListening()
     proc run301() =
       var events: seq[SseEvent] = @[]
       let client = newSyncSseClient(clientUrl(port, "/old"), config = NoReconnect)
@@ -803,7 +820,7 @@ suite "Redirects":
                  sseResponse("data: temp-ok\n\n")]
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
-    sleep(100)
+    awaitListening()
     proc run307() =
       var events: seq[SseEvent] = @[]
       let client = newSyncSseClient(clientUrl(port, "/original"), config = NoReconnect)
@@ -821,7 +838,7 @@ suite "Redirects":
                  sseResponse("data: perm-ok\n\n")]
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
-    sleep(100)
+    awaitListening()
     proc run308() =
       var events: seq[SseEvent] = @[]
       let client = newSyncSseClient(clientUrl(port, "/old"), config = NoReconnect)
@@ -839,7 +856,7 @@ suite "Redirects":
                  sseResponse("data: final\n\n")]
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
-    sleep(100)
+    awaitListening()
     proc runChain() =
       var events: seq[SseEvent] = @[]
       let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
@@ -857,7 +874,7 @@ suite "Redirects":
                  redirectResponse(302, "http://127.0.0.1:" & $port & "/c")]
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
-    sleep(100)
+    awaitListening()
     proc runMaxRedir() =
       var errors: seq[string] = @[]
       let cfg = SyncSseClientConfig(
@@ -902,7 +919,7 @@ suite "Redirects":
                  sseResponse("data: hello\n\n")]
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port, resps))
-    sleep(100)
+    awaitListening()
     proc runOrigin() =
       var events: seq[SseEvent] = @[]
       let client = newSyncSseClient(clientUrl(port, "/start"), config = NoReconnect)
@@ -928,12 +945,24 @@ proc serveSlowBody(cfg: SlowServerConfig) {.thread.} =
   server.setSockOpt(OptReuseAddr, true)
   server.bindAddr(Port(cfg.port), address = "127.0.0.1")
   server.listen()
+  discard serversListening.fetchAdd(1)
   try:
     var client: Socket
     server.accept(client)
     discard client.recv(4096)
     client.send(cfg.headers)
-    sleep(cfg.delayMs)
+    # Stay silent for up to delayMs, but return as soon as the client
+    # disconnects — a blind sleep(delayMs) would keep joinThread (and the
+    # whole suite) blocked long after the client under test closed or
+    # cancelled. The client never sends after its request, so recv only
+    # ever times out (still connected) or returns "" (peer closed).
+    var waited = 0
+    while waited < cfg.delayMs:
+      try:
+        if client.recv(1, timeout = 100).len == 0:
+          break
+      except TimeoutError:
+        waited += 100
     if cfg.body.len > 0:
       client.send(cfg.body)
     client.close()
@@ -961,7 +990,7 @@ suite "close()":
       body: "data: late\n\n",
       delayMs: 3000)
     createThread(thr, serveSlowBody, cfg)
-    sleep(200)
+    awaitListening()
 
     proc runClose() =
       var events: seq[SseEvent] = @[]
@@ -995,7 +1024,7 @@ suite "close()":
       body: "",
       delayMs: 3000)
     createThread(thr, serveSlowBody, cfg)
-    sleep(200)
+    awaitListening()
 
     proc runNoError() =
       var errors: seq[string] = @[]
@@ -1020,7 +1049,7 @@ suite "close()":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("data: hi\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc runCloseReconn() =
       var errorFired = false
@@ -1056,7 +1085,7 @@ suite "close()":
     let port = findFreePort()
     var thr: Thread[ServerConfig]
     createThread(thr, serveOnce, (port, sseResponse("data: x\n\n")))
-    sleep(100)
+    awaitListening()
     proc runNoop() =
       let c = newSyncSseClient(clientUrl(port), config = NoReconnect)
       c.connect()
@@ -1096,7 +1125,7 @@ suite "CancelToken":
       body: "",
       delayMs: 3000)
     createThread(thr, serveSlowBody, cfg)
-    sleep(200)
+    awaitListening()
 
     proc runCancel() =
       var events: seq[SseEvent] = @[]
@@ -1137,7 +1166,7 @@ suite "CancelToken":
       body: "", delayMs: 3000)
     createThread(srv1, serveSlowBody, scfg1)
     createThread(srv2, serveSlowBody, scfg2)
-    sleep(200)
+    awaitListening(2)
 
     var state1, state2: ReadyState
     let token = newCancelToken()
@@ -1171,7 +1200,7 @@ suite "CancelToken":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("data: hi\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc runCancelReconn() =
       let token = newCancelToken()
@@ -1215,7 +1244,7 @@ suite "Stall Timeout":
       body: "",
       delayMs: 2000)
     createThread(thr, serveSlowBody, cfg)
-    sleep(200)
+    awaitListening()
 
     proc runStall() =
       var events: seq[SseEvent] = @[]
@@ -1255,7 +1284,7 @@ suite "Stall Timeout":
     var thr: Thread[MultiServerConfig]
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("data: first\n\n"), sseResponse("data: second\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc runStallReconn() =
       var openCount = 0
@@ -1361,7 +1390,7 @@ suite "Parser Integration":
     createThread(thr, serveMulti, multiCfg(port,
       [sseResponse("data: partial"),
        sseResponse("data: fresh\n\n")]))
-    sleep(100)
+    awaitListening()
 
     proc runReset() =
       var events: seq[SseEvent] = @[]
@@ -1397,7 +1426,127 @@ suite "Parser Integration":
     joinThread(thr)
 
 # ===========================================================================
-# 13. Accessors
+# 13. Custom Requests (method / extra headers / body)
+# ===========================================================================
+
+# Server that captures a single request for wire-level verification.
+type SingleCaptureConfig = object
+  port: int
+  resp: string
+  reqBuf: ptr string
+
+proc serveCaptureOnce(cfg: SingleCaptureConfig) {.thread.} =
+  var server = newSocket(buffered = false)
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(cfg.port), address = "127.0.0.1")
+  server.listen()
+  discard serversListening.fetchAdd(1)
+  try:
+    var client: Socket
+    server.accept(client)
+    cfg.reqBuf[] = client.recv(4096)
+    client.send(cfg.resp)
+    client.close()
+  except CatchableError:
+    discard
+  server.close()
+
+suite "Custom Requests":
+
+  test "default config sends spec-compliant GET":
+    let client = newSyncSseClient("http://example.com/events")
+    check client.config.httpMethod == HttpGet
+    check client.config.extraHeaders.len == 0
+    check client.config.body == ""
+
+  test "reserved extra header rejected at construction":
+    for name in ["Host", "accept", "Cache-Control", "Last-Event-ID",
+                 "content-length"]:
+      var cfg = NoReconnect
+      cfg.extraHeaders = @[(name, "v")]
+      expect(ValueError):
+        discard newSyncSseClient("http://example.com/events", config = cfg)
+
+  test "CR/LF in extra header rejected at construction":
+    var cfg = NoReconnect
+    cfg.extraHeaders = @[("X-Bad", "v\r\nInjected: yes")]
+    expect(ValueError):
+      discard newSyncSseClient("http://example.com/events", config = cfg)
+
+  test "body with GET rejected at construction":
+    var cfg = NoReconnect
+    cfg.body = "payload"
+    expect(ValueError):
+      discard newSyncSseClient("http://example.com/events", config = cfg)
+
+  test "POST with headers and body goes over the wire; stream parsed":
+    var reqBuf = ""
+    let port = findFreePort()
+    var thr: Thread[SingleCaptureConfig]
+    createThread(thr, serveCaptureOnce, SingleCaptureConfig(
+      port: port,
+      resp: sseResponse("data: streamed\n\n"),
+      reqBuf: addr reqBuf))
+    awaitListening()
+
+    proc runPost() =
+      let payload = """{"model":"m","stream":true}"""
+      var cfg = NoReconnect
+      cfg.httpMethod = HttpPost
+      cfg.extraHeaders = @[("content-type", "application/json"),
+                           ("x-api-key", "secret")]
+      cfg.body = payload
+
+      var events: seq[SseEvent] = @[]
+      let client = newSyncSseClient(clientUrl(port), config = cfg)
+      client.onEvent = proc(e: SseEvent) = events.add(e)
+      client.connect()
+
+      check events.len == 1
+      check events[0].data == "streamed"
+
+    runPost()
+    joinThread(thr)
+
+    let payload = """{"model":"m","stream":true}"""
+    check reqBuf.startsWith("POST /events HTTP/1.1\r\n")
+    check "Host: 127.0.0.1:" & $port & "\r\n" in reqBuf
+    check "Accept: text/event-stream\r\n" in reqBuf
+    check "content-type: application/json\r\n" in reqBuf
+    check "x-api-key: secret\r\n" in reqBuf
+    check "Content-Length: " & $payload.len & "\r\n" in reqBuf
+    check reqBuf.endsWith("\r\n\r\n" & payload)
+
+  test "extra headers re-sent on reconnection":
+    var reqBuf: array[2, string]
+    let port = findFreePort()
+    var thr: Thread[CaptureServerConfig]
+    let scfg = CaptureServerConfig(
+      port: port,
+      resp1: sseResponse("data: first\n\n"),
+      resp2: sseResponse("data: second\n\n"),
+      reqBuf: addr reqBuf)
+    createThread(thr, serveCaptureMulti, scfg)
+    awaitListening()
+
+    proc runReconn() =
+      var cfg = FastReconnect
+      cfg.extraHeaders = @[("Authorization", "Bearer tok")]
+      var openCount = 0
+      let client = newSyncSseClient(clientUrl(port), config = cfg)
+      client.onOpen = proc() =
+        inc openCount
+        if openCount >= 2: client.close()
+      client.connect()
+
+    runReconn()
+    joinThread(thr)
+
+    check "Authorization: Bearer tok" in reqBuf[0]
+    check "Authorization: Bearer tok" in reqBuf[1]
+
+# ===========================================================================
+# 14. Accessors
 # ===========================================================================
 
 suite "Accessors":
