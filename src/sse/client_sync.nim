@@ -105,10 +105,10 @@ type
   SyncSseClient* = ref object
     ## A blocking SSE connection with automatic reconnection.
     ##
-    ## Set callbacks (`onEvent`, `onOpen`, `onError`, `onComment`) before
-    ## calling `connect`. The `connect` call blocks until `close()` is
-    ## called, the cancel token fires, or a fatal (non-recoverable) error
-    ## occurs.
+    ## Set callbacks (`onEvent`, `onOpen`, `onError`, `onComment`,
+    ## `onHttpResponse`) before calling `connect`. The `connect` call
+    ## blocks until `close()` is called, the cancel token fires, or a
+    ## fatal (non-recoverable) error occurs.
 
     # -- Public state --
     readyState*: ReadyState
@@ -120,6 +120,21 @@ type
     onComment*: SseCommentHandler
     onOpen*: SseNotifyHandler
     onError*: SseErrorHandler
+    onHttpResponse*: SseHttpResponseHandler
+                              ## Fired once per HTTP response received,
+                              ## with the parsed status and headers,
+                              ## before the response is validated or its
+                              ## body is consumed. Fires for every
+                              ## response the server sends: 200s, error
+                              ## statuses (e.g. a 429 whose Retry-After
+                              ## header is otherwise invisible), each
+                              ## redirect hop, and every reconnection
+                              ## attempt. Observation-only — it cannot
+                              ## alter how the response is handled — but
+                              ## calling `close()` (or firing the cancel
+                              ## token) from inside it aborts the
+                              ## connection quietly: no open or error
+                              ## event follows.
 
     # -- TLS --
     when defined(ssl):
@@ -427,6 +442,18 @@ proc attemptConnect(client: SyncSseClient): ConnectOutcome =
     if hp.hasFailed:
       client.closeSocket()
       return coRetry
+
+    # -- Response hook --
+    # Fired before validation so the handler sees every response the
+    # server actually sent — 200s, error statuses, and each redirect hop
+    # — not just the ones that validate as an SSE stream.
+    if client.onHttpResponse != nil:
+      client.onHttpResponse(resp)
+      if client.isCancelled:
+        # The handler closed the client (or the token fired): tear down
+        # quietly, before validation can fire open/error events.
+        client.closeSocket()
+        return coFatal
 
     # -- Validate response --
     case validateResponse(resp)

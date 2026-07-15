@@ -113,6 +113,18 @@ Rules, enforced with `ValueError` at construction:
 
 **Set `autoReconnect: false` for request/response-style streams.** Reconnection re-sends the entire request — method, headers, and body — so an LLM endpoint would re-run (and re-bill) the whole generation, and `Last-Event-ID` resumption is meaningless there. Auto-reconnect with custom requests is only sensible for endpoints where replaying the request is idempotent.
 
+### Inspecting the HTTP response: onHttpResponse
+
+Both clients expose an `onHttpResponse` callback that receives the parsed HTTP response — status code plus headers (names lowercased) — as soon as the header block is read, *before* the response is validated or its body is consumed. Unlike `onOpen` (which only fires for a valid SSE stream) it fires for **every** response the server sends: 200s, error statuses, each redirect hop, and every reconnection attempt. That makes response metadata that is otherwise invisible — rate-limit headers on a 429, request IDs, cache status — observable:
+
+```nim
+client.onHttpResponse = proc (resp: HttpResponse) =
+  if resp.statusCode == 429:
+    echo "rate limited; Retry-After: ", resp.getHeader("retry-after")
+```
+
+The hook is observation-only: it cannot change how the client handles the response (a 429 still surfaces as a fatal `onError` afterwards, redirects are still followed). The one exception is aborting: calling `close()` — or firing the client's `CancelToken` — from inside the handler tears the connection down quietly, with no subsequent `onOpen` or `onError`.
+
 ### Cancellation
 
 Both clients accept an optional `CancelToken`. A token can be shared across any number of clients — sync and async alike — and a single `cancel()` call, safe from any thread (the flag is atomic), stops all of them at their next poll (sync) or yield point (async). Cancellation behaves like `close()`: no error event fires, and events already parsed but not yet delivered are silently dropped.
@@ -193,6 +205,7 @@ The parser, dispatch rules, reconnection semantics, `Last-Event-ID` handling, an
 - **Callbacks instead of the DOM `EventTarget` API** — `onEvent` receives every event type; there is no per-type listener registration.
 - **No CORS / `withCredentials`** — meaningless outside a browser.
 - **Custom request options** (`httpMethod`/`extraHeaders`/`body`) — the spec is GET-only with fixed headers; these opt-in fields exist for non-spec endpoints that stream SSE in response to a custom request (see "Custom requests" above). The defaults produce a byte-identical spec-compliant request.
+- **`onHttpResponse` hook** — EventSource exposes no response metadata; this opt-in callback surfaces the parsed status and headers of every response received, before validation (see "Inspecting the HTTP response" above). Purely observational; leaving it unset changes nothing.
 - **TLS failures are fatal, not retried.** The spec would reconnect on any non-abort network error, but retrying a deterministic handshake or hostname failure would hammer a misconfigured (or MITM'd) endpoint forever.
 - **All common redirect codes handled** (301/302/303/307/308; the spec only names 301/307). Permanent redirects (301/308) update the URL used for reconnection; temporary ones don't.
 

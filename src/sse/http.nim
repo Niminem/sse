@@ -31,6 +31,13 @@ type
     statusCode*: int
     headers*: seq[(string, string)]  ## Names are lowercased at parse time.
 
+  SseHttpResponseHandler* = proc (resp: HttpResponse) {.closure, gcsafe.}
+    ## Callback fired by the clients once per HTTP response received —
+    ## including error statuses, each redirect hop, and every reconnection
+    ## attempt — after the status line and headers are parsed but before
+    ## the response is validated or its body is consumed. Lives here
+    ## (rather than in `sse/types`) because it references `HttpResponse`.
+
   HeaderParser* = object
     ## Incremental HTTP response header accumulator.
     ##

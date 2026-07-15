@@ -81,6 +81,7 @@ suite "Construction & URL Validation":
     check client.onComment == nil
     check client.onOpen == nil
     check client.onError == nil
+    check client.onHttpResponse == nil
     check client.lastEventId == ""
     check client.reconnectionTime == 3000
 
@@ -1566,3 +1567,117 @@ suite "Accessors":
       check client.reconnectionTime == 3000
       client.connect()
       check client.reconnectionTime == 7500
+
+# ===========================================================================
+# 15. onHttpResponse Hook
+# ===========================================================================
+
+suite "onHttpResponse Hook":
+
+  test "fires with parsed status and headers before onOpen":
+    withServer(sseResponse("data: hi\n\n")):
+      var order: seq[string] = @[]
+      var status = 0
+      var contentType = ""
+
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
+      client.onHttpResponse = proc(resp: HttpResponse) =
+        order.add("response")
+        status = resp.statusCode
+        contentType = resp.getHeader("content-type")
+      client.onOpen = proc() = order.add("open")
+
+      client.connect()
+
+      check order == @["response", "open"]
+      check status == 200
+      check contentType == "text/event-stream"
+
+  test "fires on error status with headers (rate-limit inspection)":
+    withServer("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\n" &
+               "Content-Length: 0\r\n\r\n"):
+      var status = 0
+      var retryAfter = ""
+      var hookFiredBeforeError = false
+      var errors: seq[string] = @[]
+
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
+      client.onHttpResponse = proc(resp: HttpResponse) =
+        status = resp.statusCode
+        retryAfter = resp.getHeader("retry-after")
+      client.onError = proc(msg: string) =
+        hookFiredBeforeError = status != 0
+        errors.add(msg)
+
+      client.connect()
+
+      check status == 429
+      check retryAfter == "120"
+      check hookFiredBeforeError
+      check errors.len == 1
+      check "HTTP 429" in errors[0]
+
+  test "fires once per redirect hop":
+    let port = findFreePort()
+    let resps = [redirectResponse(302, "http://127.0.0.1:" & $port & "/hop"),
+                 sseResponse("data: final\n\n")]
+    var thr: Thread[MultiServerConfig]
+    createThread(thr, serveMulti, multiCfg(port, resps))
+    awaitListening()
+
+    proc runHops() =
+      var statuses: seq[int] = @[]
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
+      client.onHttpResponse = proc(resp: HttpResponse) =
+        statuses.add(resp.statusCode)
+      client.onEvent = proc(e: SseEvent) = discard
+      client.connect()
+      check statuses == @[302, 200]
+
+    runHops()
+    joinThread(thr)
+
+  test "fires again on reconnection":
+    let port = findFreePort()
+    var thr: Thread[MultiServerConfig]
+    createThread(thr, serveMulti, multiCfg(port,
+      [sseResponse("data: first\n\n"), sseResponse("data: second\n\n")]))
+    awaitListening()
+
+    proc runReconn() =
+      var statuses: seq[int] = @[]
+      var openCount = 0
+      let client = newSyncSseClient(clientUrl(port), config = FastReconnect)
+      client.onHttpResponse = proc(resp: HttpResponse) =
+        statuses.add(resp.statusCode)
+      client.onOpen = proc() =
+        inc openCount
+        if openCount >= 2: client.close()
+      client.connect()
+
+      check statuses.len >= 2
+      check statuses[0] == 200
+      check statuses[1] == 200
+
+    runReconn()
+    joinThread(thr)
+
+  test "close() inside the hook aborts quietly (no onOpen, no onError)":
+    withServer(sseResponse("data: hi\n\n")):
+      var opened = false
+      var errors: seq[string] = @[]
+      var events: seq[SseEvent] = @[]
+
+      let client = newSyncSseClient(clientUrl(port), config = NoReconnect)
+      client.onHttpResponse = proc(resp: HttpResponse) =
+        client.close()
+      client.onOpen = proc() = opened = true
+      client.onError = proc(msg: string) = errors.add(msg)
+      client.onEvent = proc(e: SseEvent) = events.add(e)
+
+      client.connect()
+
+      check client.readyState == Closed
+      check not opened
+      check errors.len == 0
+      check events.len == 0
